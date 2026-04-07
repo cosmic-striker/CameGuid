@@ -1,0 +1,25 @@
+.env
+*.log
+node_modules/
+dist/
+/tmp/
+*.exe
+*.dll
+*.so
+*.dylib
+__debug_bin*
+
+# Go
+backend/vendor/
+
+# IDE
+.vscode/
+.idea/
+
+# Docker volumes
+pgdata/
+redisdata/
+
+# SSL certs (generated)
+nginx/ssl/*.pem
+nginx/ssl/*.key

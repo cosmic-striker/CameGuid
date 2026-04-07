@@ -1,0 +1,25 @@
+# FastAPI framework
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.1
+
+# Database
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+alembic==1.14.1
+
+# Encryption
+cryptography==44.0.0
+
+# ONVIF (optional, can be disabled)
+onvif-zeep==0.2.12
+zeep==4.3.1
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.25.0
+httpx==0.28.1
+
+# Utilities
+python-multipart==0.0.19
