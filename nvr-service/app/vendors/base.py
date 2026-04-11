@@ -7,6 +7,22 @@ support for a new vendor.
 """
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+
+
+@dataclass
+class DiscoveredChannel:
+    """
+    A camera channel enumerated in real time from an NVR.
+
+    This represents a channel the NVR reports as actually connected,
+    as opposed to channels blindly generated 1..channel_count.
+    """
+
+    channel_number: int
+    name: str | None = None
+    enabled: bool = True
+    online: bool | None = None
 
 
 class VendorStrategy(ABC):
@@ -91,3 +107,32 @@ class VendorStrategy(ABC):
             raise ValueError(
                 f"Invalid stream_type '{stream_type}'. Must be 'main' or 'sub'."
             )
+
+    async def discover_channels(
+        self,
+        ip: str,
+        http_port: int,
+        rtsp_port: int,
+        username: str,
+        password: str,
+    ) -> list[DiscoveredChannel] | None:
+        """
+        Optionally enumerate the camera channels actually connected to an NVR.
+
+        Vendor strategies that expose an HTTP API (Hikvision ISAPI, Dahua CGI)
+        override this to query the device. Strategies without a discovery
+        mechanism return None, in which case the discovery service falls back
+        to generating channels from the NVR's configured channel_count.
+
+        Args:
+            ip: NVR IP address.
+            http_port: NVR management HTTP port (typically 80).
+            rtsp_port: NVR RTSP port (typically 554).
+            username: NVR login username.
+            password: NVR login password (plaintext).
+
+        Returns:
+            List of discovered channels, or None to signal "not supported" so
+            the caller can fall back to channel_count generation.
+        """
+        return None
