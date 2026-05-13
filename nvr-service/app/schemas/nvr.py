@@ -129,6 +129,15 @@ class GenerateChannelsResponse(BaseModel):
     channels: list["ChannelBriefResponse"] = []
 
 
+class DiscoverChannelsResponse(BaseModel):
+    """Response from real-time NVR channel auto-discovery."""
+
+    message: str
+    channels_created: int
+    channels: list["ChannelBriefResponse"] = []
+
+
 # Resolve forward references
 NVRDetailResponse.model_rebuild()
 GenerateChannelsResponse.model_rebuild()
+DiscoverChannelsResponse.model_rebuild()
