@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.schemas.nvr import (
+    DiscoverChannelsResponse,
     GenerateChannelsResponse,
     NVRCreate,
     NVRDetailResponse,
@@ -23,7 +24,7 @@ from app.schemas.nvr import (
 )
 from app.schemas.channel import ChannelResponse
 from app.schemas.common import SuccessResponse
-from app.services import nvr_service, rtsp_service, validation_service
+from app.services import discovery_service, nvr_service, rtsp_service, validation_service
 
 router = APIRouter(prefix="/nvr", tags=["NVR"])
 
@@ -136,6 +137,32 @@ async def generate_channels(
     channels = await nvr_service.generate_channels(db, nvr_id)
     return GenerateChannelsResponse(
         message=f"Generated {len(channels)} channels.",
+        channels_created=len(channels),
+        channels=[
+            ChannelResponse.model_validate(ch).__dict__
+            for ch in channels
+        ],
+    )
+
+
+@router.post(
+    "/{nvr_id}/discover",
+    response_model=DiscoverChannelsResponse,
+    summary="Auto-Discover Channels",
+    description=(
+        "Query the NVR (Hikvision ISAPI / Dahua CGI / ONVIF) for the camera "
+        "channels actually connected, then replace the stored channels with "
+        "the discovered set. Falls back to channel_count generation for "
+        "'generic' vendors or if the NVR reports no channels."
+    ),
+)
+async def discover_channels(
+    nvr_id: UUID,
+    db: AsyncSession = Depends(get_db),
+) -> DiscoverChannelsResponse:
+    channels = await discovery_service.discover_nvr_channels(db, nvr_id)
+    return DiscoverChannelsResponse(
+        message=f"Discovered {len(channels)} channels.",
         channels_created=len(channels),
         channels=[
             ChannelResponse.model_validate(ch).__dict__
