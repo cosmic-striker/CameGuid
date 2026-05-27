@@ -41,9 +41,9 @@ def parse_digest_challenge(www_authenticate: str) -> dict:
     Handles both quoted and unquoted parameter values.
     """
     params: dict[str, str] = {}
-    for key, quoted, unquoted in _qop_re.finditer(www_authenticate):
-        value = quoted if quoted is not None else unquoted
-        params[key] = value
+    for match in _qop_re.finditer(www_authenticate):
+        quoted, unquoted = match.group(2), match.group(3)
+        params[match.group(1)] = quoted if quoted is not None else unquoted
     return params
 
 
