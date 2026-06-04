@@ -37,6 +37,10 @@ type Config struct {
 	StreamIdleTimeout  int
 	StreamMaxSessions  int
 	HLSSegmentDuration int
+
+	// Snapshots
+	SnapshotInterval int // seconds between periodic snapshot captures
+	SnapshotWidth    int // max width of captured snapshot frames
 }
 
 // Load reads configuration from environment variables with sensible defaults.
@@ -56,6 +60,8 @@ func Load() (*Config, error) {
 		StreamIdleTimeout:  getEnvInt("CAMGUID_STREAM_IDLE_TIMEOUT", 60),
 		StreamMaxSessions:  getEnvInt("CAMGUID_STREAM_MAX_SESSIONS", 20),
 		HLSSegmentDuration: getEnvInt("CAMGUID_HLS_SEGMENT_DURATION", 2),
+		SnapshotInterval:   getEnvInt("CAMGUID_SNAPSHOT_INTERVAL", 30),
+		SnapshotWidth:      getEnvInt("CAMGUID_SNAPSHOT_WIDTH", 640),
 	}
 
 	// Auto-generate JWT secret if not provided
@@ -102,6 +108,12 @@ func (c *Config) Validate() error {
 	}
 	if c.StreamMaxSessions < 1 || c.StreamMaxSessions > 100 {
 		return fmt.Errorf("CAMGUID_STREAM_MAX_SESSIONS must be between 1 and 100")
+	}
+	if c.StreamIdleTimeout < 5 {
+		return fmt.Errorf("CAMGUID_STREAM_IDLE_TIMEOUT must be at least 5 seconds")
+	}
+	if c.SnapshotInterval < 5 {
+		return fmt.Errorf("CAMGUID_SNAPSHOT_INTERVAL must be at least 5 seconds")
 	}
 	return nil
 }
