@@ -28,7 +28,13 @@ const (
 	streamBaseDir   = "/tmp/streams"
 	snapshotBaseDir = "/tmp/snapshots"
 	maxRetries      = 3
+
+	heartbeatKeyPrefix = "camguid:heartbeat:"
 )
+
+func heartbeatKey(sessionID string) string {
+	return heartbeatKeyPrefix + sessionID
+}
 
 type StreamSession struct {
 	ID        string
@@ -50,6 +56,7 @@ type RelayService struct {
 	log      zerolog.Logger
 	sessions map[string]*StreamSession
 	mu       sync.RWMutex
+	snapshots *SnapshotManager
 }
 
 func main() {
@@ -79,13 +86,15 @@ func main() {
 	// Ensure directories exist
 	os.MkdirAll(streamBaseDir, 0755)
 	os.MkdirAll(snapshotBaseDir, 0755)
+	ensureSnapshotDir(snapshotBaseDir)
 
 	relay := &RelayService{
-		pool:     pool,
-		rdb:      rdb,
-		cfg:      cfg,
-		log:      log,
-		sessions: make(map[string]*StreamSession),
+		pool:      pool,
+		rdb:       rdb,
+		cfg:       cfg,
+		log:       log,
+		sessions:  make(map[string]*StreamSession),
+		snapshots: NewSnapshotManager(),
 	}
 
 	// Start idle session cleanup loop
@@ -174,6 +183,118 @@ func main() {
 		return c.SendFile(path)
 	})
 
+	// Heartbeat: the Live Wall calls this periodically for sessions currently
+	// being viewed, renewing the session's lease in Redis. Sessions whose lease
+	// expires (no viewers) are reclaimed by the cleanup loop, so HLS sessions
+	// are on-demand rather than persistent.
+	app.Post("/heartbeat/:id", func(c *fiber.Ctx) error {
+		sessionID := c.Params("id")
+		relay.mu.RLock()
+		_, ok := relay.sessions[sessionID]
+		relay.mu.RUnlock()
+		if !ok {
+			return c.Status(404).JSON(fiber.Map{"error": "Session not found"})
+		}
+		ttl := time.Duration(relay.cfg.StreamIdleTimeout) * time.Second
+		relay.rdb.Set(context.Background(), heartbeatKey(sessionID), "1", ttl)
+		return c.JSON(fiber.Map{"status": "ok"})
+	})
+
+	// One-shot snapshot capture — grab a single frame now.
+	app.Post("/snapshot/capture", func(c *fiber.Ctx) error {
+		var req struct {
+			DeviceID  string `json:"device_id"`
+			Channel   int    `json:"channel"`
+			StreamURL string `json:"stream_url"`
+			Width     int    `json:"width"`
+		}
+		if err := c.BodyParser(&req); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid request"})
+		}
+		if req.DeviceID == "" || req.StreamURL == "" {
+			return c.Status(400).JSON(fiber.Map{"error": "device_id and stream_url are required"})
+		}
+		if req.Width == 0 {
+			req.Width = relay.cfg.SnapshotWidth
+		}
+
+		go func() {
+			if err := relay.snapshots.CaptureNow(req.DeviceID, req.StreamURL, req.Channel, req.Width); err != nil {
+				relay.log.Warn().Str("device", req.DeviceID).Err(err).Msg("One-shot snapshot capture failed")
+			}
+		}()
+
+		return c.JSON(fiber.Map{
+			"status":       "queued",
+			"snapshot_url": fmt.Sprintf("/stream/snapshots/%s.jpg", req.DeviceID),
+		})
+	})
+
+	// Periodic snapshot job — registers a repeating capture loop for a device.
+	app.Post("/snapshot/start", func(c *fiber.Ctx) error {
+		var req struct {
+			DeviceID  string `json:"device_id"`
+			Channel   int    `json:"channel"`
+			StreamURL string `json:"stream_url"`
+			Width     int    `json:"width"`
+			Interval  int    `json:"interval"`
+		}
+		if err := c.BodyParser(&req); err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid request"})
+		}
+		if req.DeviceID == "" || req.StreamURL == "" {
+			return c.Status(400).JSON(fiber.Map{"error": "device_id and stream_url are required"})
+		}
+		if req.Width == 0 {
+			req.Width = relay.cfg.SnapshotWidth
+		}
+		if req.Interval == 0 {
+			req.Interval = relay.cfg.SnapshotInterval
+		}
+
+		job := relay.snapshots.Start(
+			req.DeviceID,
+			req.StreamURL,
+			req.Channel,
+			req.Width,
+			time.Duration(req.Interval)*time.Second,
+		)
+
+		return c.JSON(fiber.Map{
+			"status":       "started",
+			"device_id":    job.DeviceID,
+			"interval_sec": int(job.Interval / time.Second),
+			"snapshot_url": fmt.Sprintf("/stream/snapshots/%s.jpg", job.DeviceID),
+		})
+	})
+
+	// Stop a periodic snapshot job.
+	app.Delete("/snapshot/stop/:deviceId", func(c *fiber.Ctx) error {
+		deviceID := c.Params("deviceId")
+		if !relay.snapshots.Stop(deviceID) {
+			return c.Status(404).JSON(fiber.Map{"error": "No active snapshot job"})
+		}
+		return c.JSON(fiber.Map{"status": "stopped"})
+	})
+
+	// List active snapshot jobs.
+	app.Get("/snapshot/jobs", func(c *fiber.Ctx) error {
+		relay.snapshots.mu.Lock()
+		defer relay.snapshots.mu.Unlock()
+		jobs := make([]fiber.Map, 0, len(relay.snapshots.jobs))
+		for _, j := range relay.snapshots.jobs {
+			jobs = append(jobs, fiber.Map{
+				"device_id":     j.DeviceID,
+				"channel":       j.Channel,
+				"interval_sec":  int(j.Interval / time.Second),
+				"last_capture":  j.LastCapture,
+				"last_error":    j.LastError,
+				"active":        j.Active,
+			})
+		}
+		return c.JSON(fiber.Map{"jobs": jobs})
+	})
+
 	go func() {
 		if err := app.Listen(":" + cfg.RelayPort); err != nil {
 			log.Fatal().Err(err).Msg("Relay server failed")
@@ -258,6 +379,12 @@ func (r *RelayService) startStream(ctx context.Context, sessionID, deviceID stri
 
 	// Monitor FFmpeg process in background
 	go r.monitorProcess(session, stderrPipe)
+
+	// Grant the session an initial lease in Redis. It is renewed by viewer
+	// heartbeats; when it expires (no viewers) the cleanup loop reclaims the
+	// session so on-demand streams free their FFmpeg slot automatically.
+	ttl := time.Duration(r.cfg.StreamIdleTimeout) * time.Second
+	r.rdb.Set(ctx, heartbeatKey(sessionID), "1", ttl)
 
 	r.log.Info().Str("session", sessionID).Str("url", streamURL).Msg("Stream started")
 	return session, nil
@@ -360,6 +487,9 @@ func (r *RelayService) stopStream(sessionID string) {
 	session.Cancel()
 	session.Retries = maxRetries + 1 // Prevent auto-restart
 
+	// Clear the session's lease so cleanup bookkeeping stays consistent
+	r.rdb.Del(context.Background(), heartbeatKey(sessionID))
+
 	// Cleanup files
 	sessionDir := filepath.Join(streamBaseDir, sessionID)
 	os.RemoveAll(sessionDir)
@@ -382,6 +512,15 @@ func (r *RelayService) stopAll() {
 	for _, s := range sessions {
 		r.stopStream(s.ID)
 	}
+
+	// Stop every periodic snapshot job
+	r.snapshots.mu.Lock()
+	for deviceID, job := range r.snapshots.jobs {
+		job.Cancel()
+		delete(r.snapshots.jobs, deviceID)
+		_ = deviceID
+	}
+	r.snapshots.mu.Unlock()
 }
 
 func (r *RelayService) cleanupLoop(ctx context.Context) {
@@ -393,9 +532,35 @@ func (r *RelayService) cleanupLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// Check for idle sessions (no viewers)
-			// In production, would track viewer heartbeats via Redis
-			r.log.Debug().Int("active", len(r.sessions)).Msg("Session cleanup tick")
+			r.reclaimIdleSessions(ctx)
+		}
+	}
+}
+
+// reclaimIdleSessions stops any HLS session whose Redis lease has expired,
+// i.e. no viewer has sent a heartbeat within StreamIdleTimeout seconds. This
+// is what keeps heavy FFmpeg usage proportional to actual viewers instead of
+// one process per camera 24/7.
+func (r *RelayService) reclaimIdleSessions(ctx context.Context) {
+	r.mu.RLock()
+	sessions := make([]*StreamSession, 0, len(r.sessions))
+	for _, s := range r.sessions {
+		sessions = append(sessions, s)
+	}
+	r.mu.RUnlock()
+
+	for _, s := range sessions {
+		exists, err := r.rdb.Exists(ctx, heartbeatKey(s.ID)).Result()
+		if err != nil {
+			r.log.Warn().Err(err).Str("session", s.ID).Msg("Heartbeat check failed")
+			continue
+		}
+		if exists == 0 {
+			r.log.Info().
+				Str("session", s.ID).
+				Str("device", s.DeviceID).
+				Msg("Reclaiming idle stream session (lease expired, no viewers)")
+			r.stopStream(s.ID)
 		}
 	}
 }
