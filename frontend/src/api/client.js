@@ -81,4 +81,14 @@ export const streamsAPI = {
   start: (data) => api.post('/start', data, { baseURL: '/stream/api' }),
   stop: (id) => api.delete(`/stop/${id}`, { baseURL: '/stream/api' }),
   list: () => api.get('/sessions', { baseURL: '/stream/api' }),
+  heartbeat: (id) => api.post(`/heartbeat/${id}`, {}, { baseURL: '/stream/api' }),
+};
+
+export const snapshotsAPI = {
+  capture: (data) => api.post('/snapshot/capture', data, { baseURL: '/stream/api' }),
+  start: (data) => api.post('/snapshot/start', data, { baseURL: '/stream/api' }),
+  stop: (deviceId) => api.delete(`/snapshot/stop/${deviceId}`, { baseURL: '/stream/api' }),
+  jobs: () => api.get('/snapshot/jobs', { baseURL: '/stream/api' }),
+  // Snapshot image URL served by nginx from the shared volume — no auth needed
+  url: (deviceId, ts) => `/stream/snapshots/${deviceId}.jpg${ts ? `?t=${ts}` : ''}`,
 };
