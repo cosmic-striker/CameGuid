@@ -469,6 +469,7 @@ tr:last-child td { border-bottom: none; }
 .badge-blue { background: rgba(59, 130, 246, 0.15); color: var(--accent-primary); }
 .badge-amber { background: rgba(245, 158, 11, 0.15); color: var(--accent-amber); }
 .badge-purple { background: rgba(139, 92, 246, 0.15); color: var(--accent-purple); }
+.badge-gray { background: rgba(148, 163, 184, 0.15); color: var(--text-muted); }
 
 /* Badge with dot */
 .badge-dot {
@@ -579,6 +580,58 @@ tr:last-child td { border-bottom: none; }
   width: 100%;
   height: 100%;
   object-fit: cover;
+}
+
+/* Snapshot thumbnail shown in grid cells when not viewing live */
+.video-cell-thumb {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  background: var(--bg-primary);
+}
+
+/* Overlay "Watch live" play button on thumbnail cells */
+.video-cell-play {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+  background: rgba(0, 0, 0, 0.55);
+  transition: background var(--transition-fast), transform var(--transition-fast);
+  z-index: 4;
+}
+
+.video-cell-play:hover {
+  background: var(--accent-primary);
+  transform: translate(-50%, -50%) scale(1.08);
+}
+
+/* Small corner button (e.g. close live view) */
+.video-cell-action {
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: var(--radius-sm);
+  color: white;
+  background: rgba(0, 0, 0, 0.55);
+  transition: background var(--transition-fast);
+}
+
+.video-cell-action:hover {
+  background: var(--accent-red);
 }
 
 .video-cell-label {
