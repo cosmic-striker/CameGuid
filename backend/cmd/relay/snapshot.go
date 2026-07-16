@@ -33,13 +33,15 @@ type SnapshotJob struct {
 
 // SnapshotManager owns all periodic snapshot jobs in the relay process.
 type SnapshotManager struct {
-	jobs map[string]*SnapshotJob
-	mu   sync.Mutex
+	runner func(ctx context.Context, streamURL, outPath string, width int) error
+	jobs   map[string]*SnapshotJob
+	mu     sync.Mutex
 }
 
 func NewSnapshotManager() *SnapshotManager {
 	return &SnapshotManager{
-		jobs: make(map[string]*SnapshotJob),
+		runner: captureSnapshot,
+		jobs:   make(map[string]*SnapshotJob),
 	}
 }
 
@@ -84,12 +86,21 @@ func (m *SnapshotManager) Stop(deviceID string) bool {
 	return true
 }
 
+// IsActive reports whether a device currently has a periodic snapshot job
+// whose last capture succeeded. Safe for concurrent use.
+func (m *SnapshotManager) IsActive(deviceID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	job, ok := m.jobs[deviceID]
+	return ok && job.Active
+}
+
 // CaptureNow performs a single immediate frame grab for a device.
 func (m *SnapshotManager) CaptureNow(deviceID, streamURL string, channel, width int) error {
 	outPath := filepath.Join(snapshotBaseDir, deviceID+".jpg")
 	ctx, cancel := context.WithTimeout(context.Background(), snapshotCaptureTimeout)
 	defer cancel()
-	return captureSnapshot(ctx, streamURL, outPath, width)
+	return m.runner(ctx, streamURL, outPath, width)
 }
 
 // captureLoop repeatedly captures frames until the job is cancelled.
@@ -115,7 +126,7 @@ func (m *SnapshotManager) capture(job *SnapshotJob) {
 	ctx, cancel := context.WithTimeout(context.Background(), snapshotCaptureTimeout)
 	defer cancel()
 
-	err := captureSnapshot(ctx, job.StreamURL, outPath, job.Width)
+	err := m.runner(ctx, job.StreamURL, outPath, job.Width)
 	job.LastCapture = time.Now()
 
 	m.mu.Lock()
