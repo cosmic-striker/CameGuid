@@ -105,3 +105,31 @@ sent to browsers — raw RTSP creds never exposed).
 - **CPU**: 600 live transcodes impossible on 1 box → snapshot+on-demand model.
 - **Bandwidth**: mitigated by sub-stream thumbnails + NVR-side aggregation.
 - **Vendor API drift**: isolation behind `VendorStrategy`; generic fallback.
+
+## 8. Progress
+
+### Phase 1 — Auto channel discovery ✅ implemented
+- `POST /api/v1/nvr/{id}/discover` enumerates real connected cameras:
+  - **Hikvision** — ISAPI `InputProxy/channels` (names/enabled/online), Digest auth.
+  - **Dahua** — CGI `configManager?name=ChannelTitle` (filters empty slots).
+  - **Generic** — falls back to `channel_count` generation.
+- New: `discovery_service`, vendor `discover_channels` hooks, RFC 7616 Digest
+  HTTP client, `DiscoverChannelsResponse`. `channel_count` auto-syncs to the
+  real detected count. Tested (`nvr-service/tests/test_vendor_discovery.py`).
+
+### Phase 2 — Snapshot grid + on-demand HLS ✅ implemented
+- **Relay (Go)**: `POST /snapshot/capture` (one-shot) and `POST /snapshot/start`
+  (periodic) FFmpeg single-frame jobs → `/tmp/snapshots/{id}.jpg`; `GET
+  /snapshot/jobs`, `DELETE /snapshot/stop/{id}`.
+- **Idle reclaim**: HLS sessions get a Redis lease; `POST /heartbeat/{id}`
+  renews it while viewed; `cleanupLoop` now genuinely stops leases that expire,
+  so FFmpeg usage tracks viewers (~`STREAM_MAX_SESSIONS`), not camera count.
+- **Live Wall (React)**: default = snapshot thumbnails (cheap, scale to
+  hundreds); click a cell → on-demand HLS for that one camera; heartbeats keep
+  it alive while open; device list limit raised to 1000 (no camera cap).
+- Config: `CAMGUID_SNAPSHOT_INTERVAL`, `CAMGUID_SNAPSHOT_WIDTH`. Relay tests +
+  race-fixed (`backend/cmd/relay/snapshot_test.go`).
+
+### Remaining
+- **Phase 3** — relay scale-out/HA (Redis session registry, N relay replicas).
+- **Phase 4** — observability + capacity sizing doc.
