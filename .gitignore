@@ -9,6 +9,12 @@ dist/
 *.dylib
 __debug_bin*
 
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
 # Go
 backend/vendor/
 
