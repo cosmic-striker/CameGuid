@@ -99,6 +99,8 @@ func main() {
 
 	// Start idle session cleanup loop
 	go relay.cleanupLoop(ctx)
+	// Listen for cross-replica commands (e.g. stop a session owned remotely)
+	go relay.subscribeToOps(ctx)
 
 	app := fiber.New(fiber.Config{AppName: "CamGuid Relay"})
 	app.Use(cors.New())
@@ -153,16 +155,48 @@ func main() {
 
 	app.Delete("/stop/:id", func(c *fiber.Ctx) error {
 		sessionID := c.Params("id")
-		relay.stopStream(sessionID)
-		return c.JSON(fiber.Map{"status": "stopped"})
+		// Stop locally if this replica owns the session...
+		if relay.stopStream(sessionID) {
+			return c.JSON(fiber.Map{"status": "stopped"})
+		}
+		// ...otherwise ask the owning replica via Redis pub/sub (multi-replica HA).
+		if exists, _ := relay.registryExists(ctx, sessionID); exists {
+			if err := relay.publishStop(ctx, sessionID); err != nil {
+				relay.log.Warn().Err(err).Str("session", sessionID).Msg("Failed to publish stop command")
+				return c.Status(500).JSON(fiber.Map{"error": "Failed to reach session owner"})
+			}
+			return c.JSON(fiber.Map{"status": "stopping"})
+		}
+		return c.Status(404).JSON(fiber.Map{"error": "Session not found"})
 	})
 
 	app.Get("/sessions", func(c *fiber.Ctx) error {
-		relay.mu.RLock()
-		defer relay.mu.RUnlock()
-
+		// Primary view: the global Redis registry (all replicas).
 		var sessions []fiber.Map
+		registered, err := relay.registryList(ctx)
+		seen := make(map[string]bool)
+		if err == nil {
+			for _, reg := range registered {
+				seen[reg.ID] = true
+				sessions = append(sessions, fiber.Map{
+					"id":         reg.ID,
+					"device_id":  reg.DeviceID,
+					"channel":    reg.Channel,
+					"status":     reg.Status,
+					"started_at": reg.StartedAt,
+				})
+			}
+		} else {
+			relay.log.Warn().Err(err).Msg("Registry list failed, falling back to local sessions")
+		}
+
+		// Merge any local sessions missing from the registry (e.g. right at
+		// startup, or if the registry write failed).
+		relay.mu.RLock()
 		for _, s := range relay.sessions {
+			if seen[s.ID] {
+				continue
+			}
 			sessions = append(sessions, fiber.Map{
 				"id":         s.ID,
 				"device_id":  s.DeviceID,
@@ -171,6 +205,8 @@ func main() {
 				"started_at": s.StartedAt,
 			})
 		}
+		relay.mu.RUnlock()
+
 		return c.JSON(fiber.Map{"sessions": sessions})
 	})
 
@@ -189,11 +225,16 @@ func main() {
 	// are on-demand rather than persistent.
 	app.Post("/heartbeat/:id", func(c *fiber.Ctx) error {
 		sessionID := c.Params("id")
-		relay.mu.RLock()
-		_, ok := relay.sessions[sessionID]
-		relay.mu.RUnlock()
-		if !ok {
-			return c.Status(404).JSON(fiber.Map{"error": "Session not found"})
+		// Defer to the shared registry so heartbeats arriving at a different
+		// replica still renew the owner's session lease.
+		exists, err := relay.registryExists(ctx, sessionID)
+		if err != nil || !exists {
+			relay.mu.RLock()
+			_, local := relay.sessions[sessionID]
+			relay.mu.RUnlock()
+			if err != nil || !local {
+				return c.Status(404).JSON(fiber.Map{"error": "Session not found"})
+			}
 		}
 		ttl := time.Duration(relay.cfg.StreamIdleTimeout) * time.Second
 		relay.rdb.Set(context.Background(), heartbeatKey(sessionID), "1", ttl)
@@ -371,6 +412,11 @@ func (r *RelayService) startStream(ctx context.Context, sessionID, deviceID stri
 	r.sessions[sessionID] = session
 	r.mu.Unlock()
 
+	// Publish to the shared registry so any relay replica can observe/stop it.
+	if err := r.registrySet(ctx, session); err != nil {
+		r.log.Warn().Err(err).Str("session", session.ID).Msg("Failed to register session in Redis")
+	}
+
 	// Save to database
 	r.pool.Exec(ctx,
 		`INSERT INTO stream_sessions (id, device_id, channel, session_type, status, hls_path, pid, started_at)
@@ -474,12 +520,12 @@ func (r *RelayService) restartStream(session *StreamSession) {
 	go r.monitorProcess(session, stderrPipe)
 }
 
-func (r *RelayService) stopStream(sessionID string) {
+func (r *RelayService) stopStream(sessionID string) bool {
 	r.mu.Lock()
 	session, ok := r.sessions[sessionID]
 	if !ok {
 		r.mu.Unlock()
-		return
+		return false
 	}
 	delete(r.sessions, sessionID)
 	r.mu.Unlock()
@@ -487,8 +533,10 @@ func (r *RelayService) stopStream(sessionID string) {
 	session.Cancel()
 	session.Retries = maxRetries + 1 // Prevent auto-restart
 
-	// Clear the session's lease so cleanup bookkeeping stays consistent
+	// Clear the session's lease and registry entry so cross-replica views are
+	// accurate and cleanup bookkeeping stays consistent.
 	r.rdb.Del(context.Background(), heartbeatKey(sessionID))
+	r.registryDelete(context.Background(), sessionID)
 
 	// Cleanup files
 	sessionDir := filepath.Join(streamBaseDir, sessionID)
@@ -499,6 +547,7 @@ func (r *RelayService) stopStream(sessionID string) {
 		`UPDATE stream_sessions SET status = 'stopped', stopped_at = now() WHERE id = $1`, sessionID)
 
 	r.log.Info().Str("session", sessionID).Msg("Stream stopped")
+	return true
 }
 
 func (r *RelayService) stopAll() {
@@ -563,4 +612,8 @@ func (r *RelayService) reclaimIdleSessions(ctx context.Context) {
 			r.stopStream(s.ID)
 		}
 	}
+
+	// Clean up sessions left behind by replicas that crashed — their FFmpeg
+	// processes are gone but registry entries + HLS files linger.
+	r.sweepOrphanedSessions(ctx)
 }
