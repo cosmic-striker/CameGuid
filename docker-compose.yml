@@ -64,7 +64,7 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
-  relay:
+  relay: &relay-base
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -84,6 +84,14 @@ services:
     restart: unless-stopped
     networks:
       - camguid_net
+
+  # HA scale-out replicas — same image/volumes, share the Redis session
+  # registry so nginx can round-robin stream API calls across all of them.
+  # Effective concurrency = replicas × STREAM_MAX_SESSIONS.
+  relay-2:
+    <<: *relay-base
+  relay-3:
+    <<: *relay-base
 
   nvr-service:
     build:
