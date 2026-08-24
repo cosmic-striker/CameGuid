@@ -131,5 +131,17 @@ sent to browsers — raw RTSP creds never exposed).
   race-fixed (`backend/cmd/relay/snapshot_test.go`).
 
 ### Remaining
-- **Phase 3** — relay scale-out/HA (Redis session registry, N relay replicas).
-- **Phase 4** — observability + capacity sizing doc.
+- **Phase 4** — observability (metrics/logs per replica) + capacity sizing doc.
+
+### Phase 3 — Relay scale-out & HA ✅ implemented
+- **Redis session registry**: every HLS session publishes metadata to
+  `camguid:session:*`. Any replica can observe all sessions (`GET /sessions`
+  global view), renew heartbeats for sessions it doesn't own, and stop remote
+  sessions via the `camguid:relay:stop` pub/sub channel.
+- **Crash recovery**: `cleanupLoop` sweeps orphaned registry entries left by
+  dead replicas and removes their shared HLS files.
+- **Infra**: `docker-compose.yml` now runs `relay`, `relay-2`, `relay-3`
+  replicas sharing the `stream_segments` + `snapshots` volumes, and nginx
+  round-robins `/stream/api/` across the pool. Effective concurrency =
+  replicas × `STREAM_MAX_SESSIONS`.
+- Tests: registry key/round-trip + relay suite with `-race`.
