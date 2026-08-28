@@ -29,6 +29,9 @@ type Config struct {
 	ScannerPort string
 	RelayPort   string
 
+	// Relay identity (for per-replica logs/metrics)
+	RelayInstanceID string
+
 	// Scanner
 	ScannerTimeout     int
 	ScannerConcurrency int
@@ -55,6 +58,7 @@ func Load() (*Config, error) {
 		APIPort:            getEnv("CAMGUID_API_PORT", "8080"),
 		ScannerPort:        getEnv("CAMGUID_SCANNER_PORT", "8081"),
 		RelayPort:          getEnv("CAMGUID_RELAY_PORT", "8082"),
+		RelayInstanceID:    resolveInstanceID(),
 		ScannerTimeout:     getEnvInt("CAMGUID_SCANNER_TIMEOUT", 60),
 		ScannerConcurrency: getEnvInt("CAMGUID_SCANNER_CONCURRENCY", 50),
 		StreamIdleTimeout:  getEnvInt("CAMGUID_STREAM_IDLE_TIMEOUT", 60),
@@ -132,6 +136,19 @@ func getEnvInt(key string, defaultVal int) int {
 		}
 	}
 	return defaultVal
+}
+
+// resolveInstanceID returns the CAMGUID_RELAY_ID override, falling back to the
+// container hostname so multi-replica deployments get distinct identities.
+func resolveInstanceID() string {
+	if id := os.Getenv("CAMGUID_RELAY_ID"); id != "" {
+		return strings.TrimSpace(id)
+	}
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		return "relay"
+	}
+	return host
 }
 
 func generateRandomHex(nBytes int) (string, error) {
