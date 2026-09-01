@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -36,6 +37,10 @@ type SnapshotManager struct {
 	runner func(ctx context.Context, streamURL, outPath string, width int) error
 	jobs   map[string]*SnapshotJob
 	mu     sync.Mutex
+
+	// Observability counters
+	capturesTotal atomic.Int64
+	failuresTotal atomic.Int64
 }
 
 func NewSnapshotManager() *SnapshotManager {
@@ -43,6 +48,13 @@ func NewSnapshotManager() *SnapshotManager {
 		runner: captureSnapshot,
 		jobs:   make(map[string]*SnapshotJob),
 	}
+}
+
+// running reports how many periodic capture jobs are active, for /metrics.
+func (m *SnapshotManager) running() int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return int64(len(m.jobs))
 }
 
 // Start registers (or replaces) a periodic capture job for a device.
@@ -100,7 +112,12 @@ func (m *SnapshotManager) CaptureNow(deviceID, streamURL string, channel, width 
 	outPath := filepath.Join(snapshotBaseDir, deviceID+".jpg")
 	ctx, cancel := context.WithTimeout(context.Background(), snapshotCaptureTimeout)
 	defer cancel()
-	return m.runner(ctx, streamURL, outPath, width)
+	err := m.runner(ctx, streamURL, outPath, width)
+	m.capturesTotal.Add(1)
+	if err != nil {
+		m.failuresTotal.Add(1)
+	}
+	return err
 }
 
 // captureLoop repeatedly captures frames until the job is cancelled.
@@ -128,6 +145,10 @@ func (m *SnapshotManager) capture(job *SnapshotJob) {
 
 	err := m.runner(ctx, job.StreamURL, outPath, job.Width)
 	job.LastCapture = time.Now()
+	m.capturesTotal.Add(1)
+	if err != nil {
+		m.failuresTotal.Add(1)
+	}
 
 	m.mu.Lock()
 	if err != nil {

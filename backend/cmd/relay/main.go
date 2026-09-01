@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -36,6 +38,17 @@ func heartbeatKey(sessionID string) string {
 	return heartbeatKeyPrefix + sessionID
 }
 
+// fmtInt renders an int64 for Prometheus text exposition.
+func fmtInt(v int64) fmt.Stringer {
+	return intStringer(v)
+}
+
+type intStringer int64
+
+func (i intStringer) String() string {
+	return fmt.Sprintf("%d", int64(i))
+}
+
 type StreamSession struct {
 	ID        string
 	DeviceID  string
@@ -57,6 +70,13 @@ type RelayService struct {
 	sessions map[string]*StreamSession
 	mu       sync.RWMutex
 	snapshots *SnapshotManager
+
+	// Observability counters (Prometheus-style /metrics)
+	startedTotal     atomic.Int64
+	stoppedTotal     atomic.Int64
+	restartsTotal    atomic.Int64
+	idleReclaims     atomic.Int64
+	registeredSess   atomic.Int64 // global registry count refreshed by cleanupLoop
 }
 
 func main() {
@@ -112,8 +132,43 @@ func main() {
 		return c.JSON(fiber.Map{
 			"status":          "ok",
 			"service":         "camguid-relay",
+			"instance":        cfg.RelayInstanceID,
 			"active_sessions": count,
 		})
+	})
+
+	// Prometheus-style metrics for per-replica monitoring.
+	app.Get("/metrics", func(c *fiber.Ctx) error {
+		relay.mu.RLock()
+		active := len(relay.sessions)
+		relay.mu.RUnlock()
+
+		var b bytes.Buffer
+		w := func(name, help, typ string, value fmt.Stringer) {
+			fmt.Fprintf(&b, "# HELP %s %s\n# TYPE %s %s\n%s %s\n", name, help, name, typ, name, value.String())
+		}
+
+		w("camguid_relay_sessions_active", "Local active HLS sessions on this replica",
+			"gauge", fmtInt(int64(active)))
+		w("camguid_relay_sessions_registered", "Sessions registered across all relay replicas",
+			"gauge", fmtInt(relay.registeredSess.Load()))
+		w("camguid_relay_snapshot_jobs", "Periodic snapshot jobs running on this replica",
+			"gauge", fmtInt(relay.snapshots.running()))
+		w("camguid_relay_sessions_started_total", "Cumulative stream sessions started", "counter",
+			fmtInt(relay.startedTotal.Load()))
+		w("camguid_relay_sessions_stopped_total", "Cumulative stream sessions stopped", "counter",
+			fmtInt(relay.stoppedTotal.Load()))
+		w("camguid_relay_ffmpeg_restarts_total", "Cumulative FFmpeg auto-restarts", "counter",
+			fmtInt(relay.restartsTotal.Load()))
+		w("camguid_relay_idle_reclaims_total", "Cumulative idle sessions reclaimed via lease expiry", "counter",
+			fmtInt(relay.idleReclaims.Load()))
+		w("camguid_relay_snapshot_captures_total", "Cumulative snapshot captures attempted", "counter",
+			fmtInt(relay.snapshots.capturesTotal.Load()))
+		w("camguid_relay_snapshot_failures_total", "Cumulative snapshot capture failures", "counter",
+			fmtInt(relay.snapshots.failuresTotal.Load()))
+
+		c.Set("Content-Type", "text/plain; version=0.0.4")
+		return c.SendString(b.String())
 	})
 
 	app.Post("/start", func(c *fiber.Ctx) error {
@@ -433,6 +488,7 @@ func (r *RelayService) startStream(ctx context.Context, sessionID, deviceID stri
 	r.rdb.Set(ctx, heartbeatKey(sessionID), "1", ttl)
 
 	r.log.Info().Str("session", sessionID).Str("url", streamURL).Msg("Stream started")
+	r.startedTotal.Add(1)
 	return session, nil
 }
 
@@ -518,6 +574,7 @@ func (r *RelayService) restartStream(session *StreamSession) {
 	r.mu.Unlock()
 
 	go r.monitorProcess(session, stderrPipe)
+	r.restartsTotal.Add(1)
 }
 
 func (r *RelayService) stopStream(sessionID string) bool {
@@ -547,6 +604,7 @@ func (r *RelayService) stopStream(sessionID string) bool {
 		`UPDATE stream_sessions SET status = 'stopped', stopped_at = now() WHERE id = $1`, sessionID)
 
 	r.log.Info().Str("session", sessionID).Msg("Stream stopped")
+	r.stoppedTotal.Add(1)
 	return true
 }
 
@@ -610,7 +668,15 @@ func (r *RelayService) reclaimIdleSessions(ctx context.Context) {
 				Str("device", s.DeviceID).
 				Msg("Reclaiming idle stream session (lease expired, no viewers)")
 			r.stopStream(s.ID)
+			r.idleReclaims.Add(1)
 		}
+	}
+
+	// Refresh the global registry gauge used by /metrics.
+	if registered, err := r.registryList(ctx); err == nil {
+		r.registeredSess.Store(int64(len(registered)))
+	} else {
+		r.log.Warn().Err(err).Msg("Registry count refresh failed")
 	}
 
 	// Clean up sessions left behind by replicas that crashed — their FFmpeg
