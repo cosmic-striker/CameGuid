@@ -131,7 +131,19 @@ sent to browsers — raw RTSP creds never exposed).
   race-fixed (`backend/cmd/relay/snapshot_test.go`).
 
 ### Remaining
-- **Phase 4** — observability (metrics/logs per replica) + capacity sizing doc.
+- Nothing blocking — all four phases implemented. Optional follow-ups:
+  nvr-service replica for discovery HA, dashboarding (Grafana) over
+  `/stream/api/metrics`, and integration of Go `devices` <-> `nvr_channels`.
+
+### Phase 4 — Observability & capacity planning ✅ implemented
+- **Relay `/metrics`** (Prometheus text): per-replica and fleet gauges/counters —
+  active/registered sessions, session started/stopped, FFmpeg restarts, idle
+  reclaims, snapshot jobs/captures/failures. `GET /health` reports `instance`.
+- **Distinct replica identity**: `CAMGUID_RELAY_ID` env (falls back to hostname;
+  compose sets `relay`, `relay-2`, `relay-3`) for per-replica logs.
+- **Capacity guide**: `docs/CAPACITY.md` — bandwidth math (sub/main × 600 cams,
+  PoE uplink sizing), CPU/memory per relay, recommended deployment sizing
+  (3 relays, etc.), scale-out triggers, and operational notes.
 
 ### Phase 3 — Relay scale-out & HA ✅ implemented
 - **Redis session registry**: every HLS session publishes metadata to
