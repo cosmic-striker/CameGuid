@@ -49,9 +49,10 @@ class Settings(BaseSettings):
     @field_validator("ENCRYPTION_KEY")
     @classmethod
     def validate_encryption_key(cls, v: str) -> str:
-        if not v:
+        if not v or _is_placeholder(v):
             raise ValueError(
-                "NVR_ENCRYPTION_KEY is required. Generate one with: "
+                "NVR_ENCRYPTION_KEY is required and must not be a placeholder. "
+                "Generate one with: "
                 'python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"'
             )
         # Fernet keys are base64-encoded and exactly 44 characters
@@ -61,12 +62,38 @@ class Settings(BaseSettings):
             )
         return v
 
+    @field_validator("STREAM_SIGNING_SECRET")
+    @classmethod
+    def validate_signing_secret(cls, v: str) -> str:
+        if not v or _is_placeholder(v):
+            raise ValueError(
+                "NVR_STREAM_SIGNING_SECRET is required and must not be a placeholder. "
+                "Run scripts/generate-secrets.sh from the repository root."
+            )
+        return v
+
     @field_validator("DATABASE_URL")
     @classmethod
     def validate_database_url(cls, v: str) -> str:
         if not v:
             raise ValueError("NVR_DATABASE_URL is required.")
         return v
+
+
+def _is_placeholder(v: str) -> bool:
+    """True when a configured value is empty or a known example placeholder."""
+    lowered = v.strip().lower()
+    if not lowered:
+        return True
+    for prefix in ("change_me", "change-me", "ch4ng3me"):
+        if lowered.startswith(prefix):
+            return True
+    return lowered in {
+        "changeme-in-production",
+        "change-me-in-production",
+        "change-me-to-a-long-random-string",
+        "camguid-nvr-stream-signing-secret-2026",
+    }
 
 
 @lru_cache()

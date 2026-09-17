@@ -1,10 +1,16 @@
 """
-Stream access API routes.
+Stream access API routes (LEGACY).
 
-Provides a secure endpoint for obtaining signed stream access tokens.
-The frontend requests a token for a specific channel, then uses that
-token to authenticate against the relay service. Raw RTSP URLs are
-NEVER returned to the client.
+These endpoints are retained for backward compatibility with deployments that
+call nvr-service directly. CamGuid's supported stream path since the security
+hardening work does NOT use this service:
+  - The Go API (`POST /api/v1/stream/token`) mints a device-bound HMAC token.
+  - The Go relay (`/stream/api/*`) verifies that token LOCALLY (HMAC +
+    PostgreSQL device lookup) and pulls the RTSP URL from the database — no
+    nvr-service round-trip. The signed-token schemes in nvr-service/app/core/
+    security.py (payload "cid") are therefore unused by the Go stack.
+
+Keep this module as-is or remove it; do not rely on it for new features.
 """
 
 from uuid import UUID

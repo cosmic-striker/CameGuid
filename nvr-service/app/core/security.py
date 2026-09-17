@@ -5,6 +5,13 @@ HMAC-signed tokens for secure stream access.
 Passwords are encrypted at rest using Fernet symmetric encryption.
 Stream tokens are short-lived HMAC-SHA256 signed JWTs that grant
 access to a specific channel stream without exposing raw RTSP URLs.
+
+LEGACY NOTE: the stream-token scheme below (payload key "cid") is now
+unused by the main CamGuid stack. Since the security hardening work the
+Go API mints device-bound stream tokens (camguid/internal/pkg/streamtoken)
+that the Go relay verifies fully locally via HMAC + a PostgreSQL lookup.
+Fernet password encryption below REMAINS the source of truth for NVR
+credentials stored by nvr-service.
 """
 
 import hashlib
