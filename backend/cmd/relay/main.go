@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -16,7 +17,10 @@ import (
 
 	"camguid/internal/config"
 	"camguid/internal/database"
+	"camguid/internal/middleware"
 	"camguid/internal/pkg/logger"
+	"camguid/internal/pkg/streamtoken"
+	"camguid/internal/repository"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
@@ -36,6 +40,22 @@ const (
 
 func heartbeatKey(sessionID string) string {
 	return heartbeatKeyPrefix + sessionID
+}
+
+// redactStreamURL strips userinfo credentials from a URL for safe logging
+// (e.g. rtsp://user:pass@host -> rtsp://***@host).
+func redactStreamURL(raw string) string {
+	idx := strings.Index(raw, "://")
+	if idx == -1 {
+		return raw
+	}
+	scheme := raw[:idx+3]
+	rest := raw[idx+3:]
+	at := strings.Index(rest, "@")
+	if at == -1 {
+		return raw
+	}
+	return scheme + "***@" + rest[at+1:]
 }
 
 // fmtInt renders an int64 for Prometheus text exposition.
@@ -58,7 +78,7 @@ type StreamSession struct {
 	Cmd       *exec.Cmd
 	Cancel    context.CancelFunc
 	Status    string
-	Retries   int
+	Retries   atomic.Int32
 	StartedAt time.Time
 }
 
@@ -67,6 +87,8 @@ type RelayService struct {
 	rdb      *redis.Client
 	cfg      *config.Config
 	log      zerolog.Logger
+	cipher   *repository.SecretCipher // decrypts stream_url at rest
+	verifier *streamtoken.Signer      // validates HMAC stream tokens
 	sessions map[string]*StreamSession
 	mu       sync.RWMutex
 	snapshots *SnapshotManager
@@ -108,11 +130,18 @@ func main() {
 	os.MkdirAll(snapshotBaseDir, 0755)
 	ensureSnapshotDir(snapshotBaseDir)
 
+	verifier, err := streamtoken.NewSigner(cfg.StreamSigningSecret)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Invalid CAMGUID_STREAM_SIGNING_SECRET")
+	}
+
 	relay := &RelayService{
 		pool:      pool,
 		rdb:       rdb,
 		cfg:       cfg,
 		log:       log,
+		cipher:    repository.NewSecretCipher(cfg.EncryptionKey),
+		verifier:  verifier,
 		sessions:  make(map[string]*StreamSession),
 		snapshots: NewSnapshotManager(),
 	}
@@ -121,6 +150,11 @@ func main() {
 	go relay.cleanupLoop(ctx)
 	// Listen for cross-replica commands (e.g. stop a session owned remotely)
 	go relay.subscribeToOps(ctx)
+
+	// Relay API auth: every stream/snapshot control call must present a
+	// short-lived HMAC token minted by the API for the target device, so the
+	// relay never needs (and never receives) raw RTSP URLs.
+	guard := middleware.StreamTokenMiddleware(verifier)
 
 	app := fiber.New(fiber.Config{AppName: "CamGuid Relay"})
 	app.Use(cors.New())
@@ -171,17 +205,22 @@ func main() {
 		return c.SendString(b.String())
 	})
 
-	app.Post("/start", func(c *fiber.Ctx) error {
+	app.Post("/start", guard, func(c *fiber.Ctx) error {
+		// The device id is taken from the signed token, never from the body.
+		deviceID := middleware.GetStreamDeviceID(c)
+		if deviceID == "" {
+			return c.Status(401).JSON(fiber.Map{"error": "Missing valid stream token"})
+		}
+		deviceUUID, err := uuid.Parse(deviceID)
+		if err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid device id in token"})
+		}
+
 		var req struct {
-			DeviceID  string `json:"device_id"`
-			Channel   int    `json:"channel"`
-			StreamURL string `json:"stream_url"`
+			Channel int `json:"channel"`
 		}
 		if err := c.BodyParser(&req); err != nil {
 			return c.Status(400).JSON(fiber.Map{"error": "Invalid request"})
-		}
-		if req.StreamURL == "" {
-			return c.Status(400).JSON(fiber.Map{"error": "stream_url is required"})
 		}
 		if req.Channel == 0 {
 			req.Channel = 1
@@ -195,8 +234,24 @@ func main() {
 		}
 		relay.mu.RUnlock()
 
+		// Resolve the (possibly credential-bearing) RTSP URL from the DB.
+		streamURL, enabled, ok, err := relay.deviceRepo().ResolveStreamURL(ctx, deviceUUID)
+		if err != nil {
+			relay.log.Error().Err(err).Str("device", deviceID).Msg("Failed to resolve stream URL")
+			return c.Status(500).JSON(fiber.Map{"error": "Failed to resolve device stream"})
+		}
+		if !ok {
+			return c.Status(404).JSON(fiber.Map{"error": "Device not found"})
+		}
+		if !enabled {
+			return c.Status(403).JSON(fiber.Map{"error": "Device is disabled"})
+		}
+		if streamURL == "" {
+			return c.Status(409).JSON(fiber.Map{"error": "Device has no stream URL configured"})
+		}
+
 		sessionID := uuid.New().String()
-		session, err := relay.startStream(ctx, sessionID, req.DeviceID, req.Channel, req.StreamURL)
+		session, err := relay.startStream(ctx, sessionID, deviceID, req.Channel, streamURL)
 		if err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 		}
@@ -208,7 +263,7 @@ func main() {
 		})
 	})
 
-	app.Delete("/stop/:id", func(c *fiber.Ctx) error {
+	app.Delete("/stop/:id", guard, func(c *fiber.Ctx) error {
 		sessionID := c.Params("id")
 		// Stop locally if this replica owns the session...
 		if relay.stopStream(sessionID) {
@@ -225,7 +280,7 @@ func main() {
 		return c.Status(404).JSON(fiber.Map{"error": "Session not found"})
 	})
 
-	app.Get("/sessions", func(c *fiber.Ctx) error {
+	app.Get("/sessions", guard, func(c *fiber.Ctx) error {
 		// Primary view: the global Redis registry (all replicas).
 		var sessions []fiber.Map
 		registered, err := relay.registryList(ctx)
@@ -278,7 +333,7 @@ func main() {
 	// being viewed, renewing the session's lease in Redis. Sessions whose lease
 	// expires (no viewers) are reclaimed by the cleanup loop, so HLS sessions
 	// are on-demand rather than persistent.
-	app.Post("/heartbeat/:id", func(c *fiber.Ctx) error {
+	app.Post("/heartbeat/:id", guard, func(c *fiber.Ctx) error {
 		sessionID := c.Params("id")
 		// Defer to the shared registry so heartbeats arriving at a different
 		// replica still renew the owner's session lease.
@@ -297,49 +352,75 @@ func main() {
 	})
 
 	// One-shot snapshot capture — grab a single frame now.
-	app.Post("/snapshot/capture", func(c *fiber.Ctx) error {
+	app.Post("/snapshot/capture", guard, func(c *fiber.Ctx) error {
 		var req struct {
-			DeviceID  string `json:"device_id"`
-			Channel   int    `json:"channel"`
-			StreamURL string `json:"stream_url"`
-			Width     int    `json:"width"`
+			Channel int `json:"channel"`
+			Width   int `json:"width"`
 		}
 		if err := c.BodyParser(&req); err != nil {
 			return c.Status(400).JSON(fiber.Map{"error": "Invalid request"})
 		}
-		if req.DeviceID == "" || req.StreamURL == "" {
-			return c.Status(400).JSON(fiber.Map{"error": "device_id and stream_url are required"})
+		deviceID := middleware.GetStreamDeviceID(c)
+		if deviceID == "" {
+			return c.Status(401).JSON(fiber.Map{"error": "Missing valid stream token"})
+		}
+		deviceUUID, err := uuid.Parse(deviceID)
+		if err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid device id in token"})
 		}
 		if req.Width == 0 {
 			req.Width = relay.cfg.SnapshotWidth
 		}
 
+		streamURL, enabled, ok, err := relay.deviceRepo().ResolveStreamURL(ctx, deviceUUID)
+		if err != nil || !ok || !enabled || streamURL == "" {
+			if err != nil {
+				relay.log.Error().Err(err).Str("device", deviceID).Msg("Snapshot: stream resolution failed")
+			}
+			code := fiber.StatusNotFound
+			msg := "Device not found or no stream configured"
+			switch {
+			case !ok:
+				code = fiber.StatusNotFound
+			case !enabled:
+				code = fiber.StatusForbidden
+				msg = "Device is disabled"
+			case streamURL == "":
+				code = fiber.StatusConflict
+				msg = "Device has no stream URL configured"
+			}
+			return c.Status(code).JSON(fiber.Map{"error": msg})
+		}
+
 		go func() {
-			if err := relay.snapshots.CaptureNow(req.DeviceID, req.StreamURL, req.Channel, req.Width); err != nil {
-				relay.log.Warn().Str("device", req.DeviceID).Err(err).Msg("One-shot snapshot capture failed")
+			if err := relay.snapshots.CaptureNow(deviceID, streamURL, req.Channel, req.Width); err != nil {
+				relay.log.Warn().Str("device", deviceID).Err(err).Msg("One-shot snapshot capture failed")
 			}
 		}()
 
 		return c.JSON(fiber.Map{
 			"status":       "queued",
-			"snapshot_url": fmt.Sprintf("/stream/snapshots/%s.jpg", req.DeviceID),
+			"snapshot_url": fmt.Sprintf("/stream/snapshots/%s.jpg", deviceID),
 		})
 	})
 
 	// Periodic snapshot job — registers a repeating capture loop for a device.
-	app.Post("/snapshot/start", func(c *fiber.Ctx) error {
+	app.Post("/snapshot/start", guard, func(c *fiber.Ctx) error {
 		var req struct {
-			DeviceID  string `json:"device_id"`
-			Channel   int    `json:"channel"`
-			StreamURL string `json:"stream_url"`
-			Width     int    `json:"width"`
-			Interval  int    `json:"interval"`
+			Channel  int `json:"channel"`
+			Width    int `json:"width"`
+			Interval int `json:"interval"`
 		}
 		if err := c.BodyParser(&req); err != nil {
 			return c.Status(400).JSON(fiber.Map{"error": "Invalid request"})
 		}
-		if req.DeviceID == "" || req.StreamURL == "" {
-			return c.Status(400).JSON(fiber.Map{"error": "device_id and stream_url are required"})
+		deviceID := middleware.GetStreamDeviceID(c)
+		if deviceID == "" {
+			return c.Status(401).JSON(fiber.Map{"error": "Missing valid stream token"})
+		}
+		deviceUUID, err := uuid.Parse(deviceID)
+		if err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "Invalid device id in token"})
 		}
 		if req.Width == 0 {
 			req.Width = relay.cfg.SnapshotWidth
@@ -348,9 +429,29 @@ func main() {
 			req.Interval = relay.cfg.SnapshotInterval
 		}
 
+		streamURL, enabled, ok, err := relay.deviceRepo().ResolveStreamURL(ctx, deviceUUID)
+		if err != nil || !ok || !enabled || streamURL == "" {
+			if err != nil {
+				relay.log.Error().Err(err).Str("device", deviceID).Msg("Snapshot job: stream resolution failed")
+			}
+			code := fiber.StatusNotFound
+			msg := "Device not found or no stream configured"
+			switch {
+			case !ok:
+				code = fiber.StatusNotFound
+			case !enabled:
+				code = fiber.StatusForbidden
+				msg = "Device is disabled"
+			case streamURL == "":
+				code = fiber.StatusConflict
+				msg = "Device has no stream URL configured"
+			}
+			return c.Status(code).JSON(fiber.Map{"error": msg})
+		}
+
 		job := relay.snapshots.Start(
-			req.DeviceID,
-			req.StreamURL,
+			deviceID,
+			streamURL,
 			req.Channel,
 			req.Width,
 			time.Duration(req.Interval)*time.Second,
@@ -365,8 +466,11 @@ func main() {
 	})
 
 	// Stop a periodic snapshot job.
-	app.Delete("/snapshot/stop/:deviceId", func(c *fiber.Ctx) error {
+	app.Delete("/snapshot/stop/:deviceId", guard, func(c *fiber.Ctx) error {
 		deviceID := c.Params("deviceId")
+		if mid := middleware.GetStreamDeviceID(c); mid != "" && mid != deviceID {
+			return c.Status(403).JSON(fiber.Map{"error": "Token not valid for this device"})
+		}
 		if !relay.snapshots.Stop(deviceID) {
 			return c.Status(404).JSON(fiber.Map{"error": "No active snapshot job"})
 		}
@@ -374,7 +478,7 @@ func main() {
 	})
 
 	// List active snapshot jobs.
-	app.Get("/snapshot/jobs", func(c *fiber.Ctx) error {
+	app.Get("/snapshot/jobs", guard, func(c *fiber.Ctx) error {
 		relay.snapshots.mu.Lock()
 		defer relay.snapshots.mu.Unlock()
 		jobs := make([]fiber.Map, 0, len(relay.snapshots.jobs))
@@ -404,6 +508,12 @@ func main() {
 	log.Info().Msg("Shutting down relay — stopping all streams...")
 	relay.stopAll()
 	app.Shutdown()
+}
+
+// deviceRepo returns a DeviceRepository bound to this replica's pool and
+// decryption cipher, used to resolve stream URLs for a signed device id.
+func (r *RelayService) deviceRepo() *repository.DeviceRepository {
+	return repository.NewDeviceRepository(r.pool, r.cipher)
 }
 
 func (r *RelayService) startStream(ctx context.Context, sessionID, deviceID string, channel int, streamURL string) (*StreamSession, error) {
@@ -487,7 +597,7 @@ func (r *RelayService) startStream(ctx context.Context, sessionID, deviceID stri
 	ttl := time.Duration(r.cfg.StreamIdleTimeout) * time.Second
 	r.rdb.Set(ctx, heartbeatKey(sessionID), "1", ttl)
 
-	r.log.Info().Str("session", sessionID).Str("url", streamURL).Msg("Stream started")
+	r.log.Info().Str("session", sessionID).Str("url", redactStreamURL(streamURL)).Msg("Stream started")
 	r.startedTotal.Add(1)
 	return session, nil
 }
@@ -514,9 +624,9 @@ func (r *RelayService) monitorProcess(session *StreamSession, stderr io.ReadClos
 		r.log.Warn().Str("session", session.ID).Err(err).Msg("FFmpeg process exited")
 
 		// Auto-restart if under retry limit
-		if session.Retries < maxRetries {
-			session.Retries++
-			r.log.Info().Str("session", session.ID).Int("retry", session.Retries).Msg("Restarting stream")
+		if session.Retries.Load() < maxRetries {
+			session.Retries.Add(1)
+			r.log.Info().Str("session", session.ID).Int("retry", int(session.Retries.Load())).Msg("Restarting stream")
 			time.Sleep(2 * time.Second)
 			r.restartStream(session)
 			return
@@ -588,7 +698,7 @@ func (r *RelayService) stopStream(sessionID string) bool {
 	r.mu.Unlock()
 
 	session.Cancel()
-	session.Retries = maxRetries + 1 // Prevent auto-restart
+	session.Retries.Store(maxRetries + 1) // Prevent auto-restart
 
 	// Clear the session's lease and registry entry so cross-replica views are
 	// accurate and cleanup bookkeeping stays consistent.
