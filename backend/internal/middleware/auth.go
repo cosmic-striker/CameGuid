@@ -73,9 +73,11 @@ func AuthMiddleware(jwtSecret string) fiber.Handler {
 		sub, _ := claims["sub"].(string)
 		userID, _ := uuid.Parse(sub)
 		role, _ := claims["role"].(string)
+		username, _ := claims["username"].(string)
 
 		c.Locals("userID", userID)
 		c.Locals("userRole", role)
+		c.Locals("username", username)
 
 		return c.Next()
 	}
@@ -119,4 +121,10 @@ func GetUserID(c *fiber.Ctx) uuid.UUID {
 func GetUserRole(c *fiber.Ctx) string {
 	role, _ := c.Locals("userRole").(string)
 	return role
+}
+
+// GetUsername extracts the authenticated username from context ("" when none).
+func GetUsername(c *fiber.Ctx) string {
+	username, _ := c.Locals("username").(string)
+	return username
 }

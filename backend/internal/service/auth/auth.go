@@ -2,8 +2,10 @@ package auth
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"camguid/internal/models"
@@ -18,7 +20,24 @@ var (
 	ErrInvalidCredentials = errors.New("invalid username or password")
 	ErrUserDisabled       = errors.New("user account is disabled")
 	ErrUserExists         = errors.New("username already exists")
+	ErrInvalidRole        = errors.New("invalid role")
 )
+
+// validRoles is the source of truth for the RBAC model.
+var validRoles = map[string]bool{"admin": true, "operator": true, "viewer": true}
+
+// randomPassword returns a cryptographically random ASCII password.
+func randomPassword(length int) string {
+	const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	b := make([]byte, length)
+	if _, err := rand.Read(b); err != nil {
+		panic(fmt.Sprintf("failed to generate random password: %v", err))
+	}
+	for i := range b {
+		b[i] = chars[int(b[i])%len(chars)]
+	}
+	return string(b)
+}
 
 type Service struct {
 	userRepo  *repository.UserRepository
@@ -62,6 +81,9 @@ func (s *Service) Login(ctx context.Context, req models.LoginRequest) (*models.T
 
 // Register creates a new user. Admin-only operation.
 func (s *Service) Register(ctx context.Context, req models.RegisterRequest) (*models.User, error) {
+	if !validRoles[req.Role] {
+		return nil, ErrInvalidRole
+	}
 	existing, _ := s.userRepo.GetByUsername(ctx, req.Username)
 	if existing != nil {
 		return nil, ErrUserExists
@@ -136,6 +158,11 @@ func (s *Service) RefreshToken(ctx context.Context, refreshToken string) (*model
 }
 
 // EnsureDefaultAdmin creates a default admin if no admins exist.
+//
+// The initial password comes from CAMGUID_BOOTSTRAP_ADMIN_PASSWORD or, if
+// unset, a cryptographically random value that is printed ONCE to stdout
+// (logs). The account is flagged must_change_password so the operator is
+// forced to set a real password on first login.
 func (s *Service) EnsureDefaultAdmin(ctx context.Context) error {
 	count, err := s.userRepo.CountAdmins(ctx)
 	if err != nil {
@@ -145,27 +172,38 @@ func (s *Service) EnsureDefaultAdmin(ctx context.Context) error {
 		return nil
 	}
 
-	password := "admin"
+	password := os.Getenv("CAMGUID_BOOTSTRAP_ADMIN_PASSWORD")
+	generated := false
+	if password == "" {
+		password = randomPassword(16)
+		generated = true
+	}
 	hash, _ := bcrypt.GenerateFromPassword([]byte(password), 12)
 
 	admin := &models.User{
-		ID:           uuid.New(),
-		Username:     "admin",
-		PasswordHash: string(hash),
-		Role:         "admin",
-		IsActive:     true,
+		ID:                 uuid.New(),
+		Username:           "admin",
+		PasswordHash:       string(hash),
+		Role:               "admin",
+		IsActive:           true,
+		MustChangePassword: true,
 	}
 
 	if err := s.userRepo.Create(ctx, admin); err != nil {
 		return err
 	}
 
-	fmt.Println("╔══════════════════════════════════════════╗")
-	fmt.Println("║   DEFAULT ADMIN ACCOUNT CREATED          ║")
-	fmt.Printf("║   Username: admin                        ║\n")
-	fmt.Printf("║   Password: %-28s ║\n", password)
-	fmt.Println("║   ⚠ Change this password after login!    ║")
-	fmt.Println("╚══════════════════════════════════════════╝")
+	fmt.Println("╔══════════════════════════════════════════════╗")
+	fmt.Println("║   DEFAULT ADMIN ACCOUNT CREATED              ║")
+	fmt.Printf("║   Username: admin                            ║\n")
+	fmt.Printf("║   Password: %-34s ║\n", password)
+	if generated {
+		fmt.Println("║   (generated randomly — copy it now)          ║")
+		fmt.Println("║   Set CAMGUID_BOOTSTRAP_ADMIN_PASSWORD to    ║")
+		fmt.Println("║   control it on future clean installs.       ║")
+	}
+	fmt.Println("║   ⚠ You will be forced to change this on login ║")
+	fmt.Println("╚══════════════════════════════════════════════╝")
 
 	return nil
 }
@@ -173,11 +211,12 @@ func (s *Service) EnsureDefaultAdmin(ctx context.Context) error {
 func (s *Service) generateTokens(user *models.User) (*models.TokenResponse, error) {
 	// Access token (15 min)
 	accessClaims := jwt.MapClaims{
-		"sub":  user.ID.String(),
-		"role": user.Role,
-		"type": "access",
-		"iat":  time.Now().Unix(),
-		"exp":  time.Now().Add(15 * time.Minute).Unix(),
+		"sub":      user.ID.String(),
+		"username": user.Username,
+		"role":     user.Role,
+		"type":     "access",
+		"iat":      time.Now().Unix(),
+		"exp":      time.Now().Add(15 * time.Minute).Unix(),
 	}
 	accessToken := jwt.NewWithClaims(jwt.SigningMethodHS256, accessClaims)
 	accessStr, err := accessToken.SignedString(s.jwtSecret)

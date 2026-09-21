@@ -9,42 +9,44 @@ import (
 
 // User represents a system user.
 type User struct {
-	ID           uuid.UUID  `json:"id"`
-	Username     string     `json:"username"`
-	Email        *string    `json:"email,omitempty"`
-	PasswordHash string     `json:"-"` // Never serialized
-	Role         string     `json:"role"`
-	IsActive     bool       `json:"is_active"`
-	LastLoginAt  *time.Time `json:"last_login_at,omitempty"`
-	CreatedAt    time.Time  `json:"created_at"`
-	UpdatedAt    time.Time  `json:"updated_at"`
+	ID                  uuid.UUID  `json:"id"`
+	Username            string     `json:"username"`
+	Email               *string    `json:"email,omitempty"`
+	PasswordHash        string     `json:"-"` // Never serialized
+	Role                string     `json:"role"`
+	IsActive            bool       `json:"is_active"`
+	MustChangePassword  bool       `json:"must_change_password"`
+	LastLoginAt         *time.Time `json:"last_login_at,omitempty"`
+	CreatedAt           time.Time  `json:"created_at"`
+	UpdatedAt           time.Time  `json:"updated_at"`
 }
 
 // Device represents a managed camera or NVR.
 type Device struct {
-	ID            uuid.UUID        `json:"id"`
-	Name          string           `json:"name"`
-	DeviceType    string           `json:"device_type"` // "camera" | "nvr"
-	IPAddress     string           `json:"ip_address"`
-	Port          int              `json:"port"`
-	MACAddress    *string          `json:"mac_address,omitempty"`
-	Manufacturer  *string          `json:"manufacturer,omitempty"`
-	Model         *string          `json:"model,omitempty"`
-	Firmware      *string          `json:"firmware,omitempty"`
-	Location      *string          `json:"location,omitempty"`
-	Tags          []string         `json:"tags"`
-	Notes         *string          `json:"notes,omitempty"`
-	IsEnabled     bool             `json:"is_enabled"`
-	StreamURL     *string          `json:"stream_url,omitempty"`
-	SecondaryURL  *string          `json:"secondary_url,omitempty"`
-	SnapshotURL   *string          `json:"snapshot_url,omitempty"`
-	WebInterface  *string          `json:"web_interface,omitempty"`
-	OnvifPath     *string          `json:"onvif_path,omitempty"`
-	ChannelCount  int              `json:"channel_count"`
-	Metadata      json.RawMessage  `json:"metadata,omitempty"`
-	LastSeenAt    *time.Time       `json:"last_seen_at,omitempty"`
-	CreatedAt     time.Time        `json:"created_at"`
-	UpdatedAt     time.Time        `json:"updated_at"`
+	ID               uuid.UUID       `json:"id"`
+	Name             string          `json:"name"`
+	DeviceType       string          `json:"device_type"` // "camera" | "nvr"
+	IPAddress        string          `json:"ip_address"`
+	Port             int             `json:"port"`
+	MACAddress       *string         `json:"mac_address,omitempty"`
+	Manufacturer     *string         `json:"manufacturer,omitempty"`
+	Model            *string         `json:"model,omitempty"`
+	Firmware         *string         `json:"firmware,omitempty"`
+	Location         *string         `json:"location,omitempty"`
+	Tags             []string        `json:"tags"`
+	Notes            *string         `json:"notes,omitempty"`
+	IsEnabled        bool            `json:"is_enabled"`
+	StreamURL        *string         `json:"-"` // encrypted at rest, NEVER serialized
+	SecondaryURL     *string         `json:"-"` // encrypted at rest, NEVER serialized
+	StreamConfigured bool            `json:"stream_configured"`
+	SnapshotURL      *string         `json:"snapshot_url,omitempty"`
+	WebInterface     *string         `json:"web_interface,omitempty"`
+	OnvifPath        *string         `json:"onvif_path,omitempty"`
+	ChannelCount     int             `json:"channel_count"`
+	Metadata         json.RawMessage `json:"metadata,omitempty"`
+	LastSeenAt       *time.Time      `json:"last_seen_at,omitempty"`
+	CreatedAt        time.Time       `json:"created_at"`
+	UpdatedAt        time.Time       `json:"updated_at"`
 }
 
 // DeviceCredential holds encrypted credentials for a device.
@@ -175,10 +177,12 @@ type RotationCamera struct {
 type AuditLog struct {
 	ID         int64           `json:"id"`
 	UserID     *uuid.UUID      `json:"user_id,omitempty"`
+	Actor      *string         `json:"actor,omitempty"` // username snapshot
 	Action     string          `json:"action"`
 	Resource   *string         `json:"resource,omitempty"`
 	ResourceID *uuid.UUID      `json:"resource_id,omitempty"`
 	Details    json.RawMessage `json:"details,omitempty"`
+	Result     string          `json:"result"` // "success" | "fail" | "denied"
 	IPAddress  *string         `json:"ip_address,omitempty"`
 	CreatedAt  time.Time       `json:"created_at"`
 }

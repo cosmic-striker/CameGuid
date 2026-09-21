@@ -13,7 +13,7 @@ type RegisterRequest struct {
 	Username string `json:"username" validate:"required,min=3,max=64"`
 	Email    string `json:"email,omitempty" validate:"omitempty,email"`
 	Password string `json:"password" validate:"required,min=8"`
-	Role     string `json:"role" validate:"required,oneof=admin viewer"`
+	Role     string `json:"role" validate:"required,oneof=admin operator viewer"`
 }
 
 type ChangePasswordRequest struct {

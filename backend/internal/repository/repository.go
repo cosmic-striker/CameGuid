@@ -21,9 +21,10 @@ func NewUserRepository(pool *pgxpool.Pool) *UserRepository {
 
 func (r *UserRepository) Create(ctx context.Context, user *models.User) error {
 	_, err := r.pool.Exec(ctx,
-		`INSERT INTO users (id, username, email, password_hash, role, is_active)
-		 VALUES ($1, $2, $3, $4, $5, $6)`,
+		`INSERT INTO users (id, username, email, password_hash, role, is_active, must_change_password)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
 		user.ID, user.Username, user.Email, user.PasswordHash, user.Role, user.IsActive,
+		user.MustChangePassword,
 	)
 	return err
 }
@@ -31,10 +32,10 @@ func (r *UserRepository) Create(ctx context.Context, user *models.User) error {
 func (r *UserRepository) GetByID(ctx context.Context, id uuid.UUID) (*models.User, error) {
 	user := &models.User{}
 	err := r.pool.QueryRow(ctx,
-		`SELECT id, username, email, password_hash, role, is_active, last_login_at, created_at, updated_at
+		`SELECT id, username, email, password_hash, role, is_active, must_change_password, last_login_at, created_at, updated_at
 		 FROM users WHERE id = $1`, id,
 	).Scan(&user.ID, &user.Username, &user.Email, &user.PasswordHash, &user.Role,
-		&user.IsActive, &user.LastLoginAt, &user.CreatedAt, &user.UpdatedAt)
+		&user.IsActive, &user.MustChangePassword, &user.LastLoginAt, &user.CreatedAt, &user.UpdatedAt)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -44,10 +45,10 @@ func (r *UserRepository) GetByID(ctx context.Context, id uuid.UUID) (*models.Use
 func (r *UserRepository) GetByUsername(ctx context.Context, username string) (*models.User, error) {
 	user := &models.User{}
 	err := r.pool.QueryRow(ctx,
-		`SELECT id, username, email, password_hash, role, is_active, last_login_at, created_at, updated_at
+		`SELECT id, username, email, password_hash, role, is_active, must_change_password, last_login_at, created_at, updated_at
 		 FROM users WHERE username = $1`, username,
 	).Scan(&user.ID, &user.Username, &user.Email, &user.PasswordHash, &user.Role,
-		&user.IsActive, &user.LastLoginAt, &user.CreatedAt, &user.UpdatedAt)
+		&user.IsActive, &user.MustChangePassword, &user.LastLoginAt, &user.CreatedAt, &user.UpdatedAt)
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -61,13 +62,13 @@ func (r *UserRepository) UpdateLastLogin(ctx context.Context, id uuid.UUID) erro
 
 func (r *UserRepository) UpdatePassword(ctx context.Context, id uuid.UUID, hash string) error {
 	_, err := r.pool.Exec(ctx,
-		`UPDATE users SET password_hash = $1, updated_at = now() WHERE id = $2`, hash, id)
+		`UPDATE users SET password_hash = $1, must_change_password = false, updated_at = now() WHERE id = $2`, hash, id)
 	return err
 }
 
 func (r *UserRepository) List(ctx context.Context) ([]models.User, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT id, username, email, role, is_active, last_login_at, created_at, updated_at
+		`SELECT id, username, email, role, is_active, must_change_password, last_login_at, created_at, updated_at
 		 FROM users ORDER BY created_at`)
 	if err != nil {
 		return nil, err
@@ -78,7 +79,7 @@ func (r *UserRepository) List(ctx context.Context) ([]models.User, error) {
 	for rows.Next() {
 		var u models.User
 		if err := rows.Scan(&u.ID, &u.Username, &u.Email, &u.Role,
-			&u.IsActive, &u.LastLoginAt, &u.CreatedAt, &u.UpdatedAt); err != nil {
+			&u.IsActive, &u.MustChangePassword, &u.LastLoginAt, &u.CreatedAt, &u.UpdatedAt); err != nil {
 			return nil, err
 		}
 		users = append(users, u)
@@ -94,21 +95,31 @@ func (r *UserRepository) CountAdmins(ctx context.Context) (int, error) {
 
 // DeviceRepository handles device CRUD operations.
 type DeviceRepository struct {
-	pool *pgxpool.Pool
+	pool   *pgxpool.Pool
+	cipher *SecretCipher
 }
 
-func NewDeviceRepository(pool *pgxpool.Pool) *DeviceRepository {
-	return &DeviceRepository{pool: pool}
+func NewDeviceRepository(pool *pgxpool.Pool, cipher *SecretCipher) *DeviceRepository {
+	return &DeviceRepository{pool: pool, cipher: cipher}
 }
 
 func (r *DeviceRepository) Create(ctx context.Context, d *models.Device) error {
-	_, err := r.pool.Exec(ctx,
+	streamURL, err := r.cipher.EncryptSecret(strOrEmpty(d.StreamURL))
+	if err != nil {
+		return err
+	}
+	secondaryURL, err := r.cipher.EncryptSecret(strOrEmpty(d.SecondaryURL))
+	if err != nil {
+		return err
+	}
+
+	_, err = r.pool.Exec(ctx,
 		`INSERT INTO devices (id, name, device_type, ip_address, port, mac_address, manufacturer, model,
 			firmware, location, tags, notes, is_enabled, stream_url, secondary_url, snapshot_url,
 			web_interface, onvif_path, channel_count, metadata)
 		 VALUES ($1,$2,$3,$4::inet,$5,$6::macaddr,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`,
 		d.ID, d.Name, d.DeviceType, d.IPAddress, d.Port, d.MACAddress, d.Manufacturer, d.Model,
-		d.Firmware, d.Location, d.Tags, d.Notes, d.IsEnabled, d.StreamURL, d.SecondaryURL,
+		d.Firmware, d.Location, d.Tags, d.Notes, d.IsEnabled, streamURL, secondaryURL,
 		d.SnapshotURL, d.WebInterface, d.OnvifPath, d.ChannelCount, d.Metadata,
 	)
 	return err
@@ -128,7 +139,34 @@ func (r *DeviceRepository) GetByID(ctx context.Context, id uuid.UUID) (*models.D
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
-	return d, err
+	if err != nil {
+		return nil, err
+	}
+	if err := r.hydrateSecrets(d); err != nil {
+		return nil, err
+	}
+	return d, nil
+}
+
+// ResolveStreamURL returns the decrypted, plaintext stream URL for a device,
+// plus whether the device exists and is enabled. Used by the relay to pull
+// RTSP credentials server-side instead of accepting them from the client.
+func (r *DeviceRepository) ResolveStreamURL(ctx context.Context, id uuid.UUID) (url string, enabled bool, ok bool, err error) {
+	var stored string
+	switch e := r.pool.QueryRow(ctx,
+		`SELECT stream_url, is_enabled FROM devices WHERE id = $1`, id,
+	).Scan(&stored, &enabled); e {
+	case pgx.ErrNoRows:
+		return "", false, false, nil
+	case nil:
+		url, err = r.cipher.DecryptSecret(stored)
+		if err != nil {
+			return "", false, true, err
+		}
+		return url, enabled, true, nil
+	default:
+		return "", false, false, e
+	}
 }
 
 func (r *DeviceRepository) List(ctx context.Context, params models.DeviceListParams) ([]models.Device, int, error) {
@@ -192,9 +230,25 @@ func (r *DeviceRepository) List(ctx context.Context, params models.DeviceListPar
 			&d.ChannelCount, &d.Metadata, &d.LastSeenAt, &d.CreatedAt, &d.UpdatedAt); err != nil {
 			return nil, 0, err
 		}
+		if err := r.hydrateSecrets(&d); err != nil {
+			return nil, 0, err
+		}
 		devices = append(devices, d)
 	}
 	return devices, total, nil
+}
+
+// hydrateSecrets decrypts at-rest encrypted stream URLs and computes the
+// StreamConfigured flag that is safe to expose via the API.
+func (r *DeviceRepository) hydrateSecrets(d *models.Device) error {
+	if d.StreamURL != nil {
+		dec, err := r.cipher.DecryptSecret(*d.StreamURL)
+		if err != nil {
+			return err
+		}
+		d.StreamConfigured = dec != ""
+	}
+	return nil
 }
 
 func (r *DeviceRepository) Update(ctx context.Context, id uuid.UUID, req models.UpdateDeviceRequest) error {
@@ -225,7 +279,18 @@ func (r *DeviceRepository) Update(ctx context.Context, id uuid.UUID, req models.
 		sets = append(sets, fmt.Sprintf("tags = $%d", argN)); args = append(args, req.Tags); argN++
 	}
 	if req.StreamURL != nil {
-		sets = append(sets, fmt.Sprintf("stream_url = $%d", argN)); args = append(args, *req.StreamURL); argN++
+		enc, err := r.cipher.EncryptSecret(*req.StreamURL)
+		if err != nil {
+			return err
+		}
+		sets = append(sets, fmt.Sprintf("stream_url = $%d", argN)); args = append(args, enc); argN++
+	}
+	if req.SecondaryURL != nil {
+		enc, err := r.cipher.EncryptSecret(*req.SecondaryURL)
+		if err != nil {
+			return err
+		}
+		sets = append(sets, fmt.Sprintf("secondary_url = $%d", argN)); args = append(args, enc); argN++
 	}
 
 	if len(sets) == 0 {
