@@ -16,6 +16,7 @@ import (
 
 	"camguid/internal/config"
 	"camguid/internal/database"
+	"camguid/internal/middleware"
 	"camguid/internal/pkg/logger"
 
 	"github.com/gofiber/fiber/v2"
@@ -89,7 +90,42 @@ func main() {
 		return c.JSON(fiber.Map{"status": "ok", "service": "camguid-scanner"})
 	})
 
-	app.Post("/scan", func(c *fiber.Ctx) error {
+	// All scan endpoints require a valid JWT (admin/operator) — minted by the
+	// API and forwarded to this service on port 8081 by nginx.
+	perm := middleware.AuthMiddleware(cfg.JWTSecret)
+	role := middleware.RequireRole("admin", "operator")
+
+	// Abuse throttling: limited concurrent scans + minimum interval between
+	// scans for the same user (enforced via Redis).
+	maxConcurrent := cfg.ScanMaxConcurrent
+	minInterval := time.Duration(cfg.ScanMinInterval) * time.Second
+	throttle := func(c *fiber.Ctx) error {
+		var running int
+		scanner.activeJobs.Range(func(_, _ any) bool {
+			running++
+			return true
+		})
+		if running >= maxConcurrent {
+			return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
+				"error": "Maximum concurrent scans already running",
+			})
+		}
+		if minInterval > 0 {
+			userID := middleware.GetUserID(c)
+			key := "scan:last:" + userID.String()
+			ok, err := rdb.SetNX(ctx, key, time.Now().Unix(), minInterval).Result()
+			if err == nil && !ok {
+				return c.Status(fiber.StatusTooManyRequests).JSON(fiber.Map{
+					"error": fmt.Sprintf("Please wait %d seconds between scans", int(minInterval.Seconds())),
+				})
+			}
+		}
+		return c.Next()
+	}
+
+	scanGroup := app.Group("/", perm, role)
+
+	scanGroup.Post("/scan", throttle, func(c *fiber.Ctx) error {
 		var req ScanRequest
 		if err := c.BodyParser(&req); err != nil {
 			return c.Status(400).JSON(fiber.Map{"error": "Invalid request body"})
@@ -120,7 +156,7 @@ func main() {
 	})
 
 	// Cancel a running scan
-	app.Post("/scan/:id/cancel", func(c *fiber.Ctx) error {
+	scanGroup.Post("/scan/:id/cancel", func(c *fiber.Ctx) error {
 		jobID := c.Params("id")
 		if cancel, ok := scanner.activeJobs.Load(jobID); ok {
 			cancel.(context.CancelFunc)()
@@ -136,7 +172,7 @@ func main() {
 		return c.Status(404).JSON(fiber.Map{"error": "No running scan with that ID"})
 	})
 
-	app.Get("/scan", func(c *fiber.Ctx) error {
+	scanGroup.Get("/scan", func(c *fiber.Ctx) error {
 		rows, err := pool.Query(ctx,
 			`SELECT id, status, scan_type, target, device_count, started_at, completed_at, created_at
 			 FROM scan_jobs ORDER BY created_at DESC LIMIT 50`)
@@ -160,7 +196,7 @@ func main() {
 		return c.JSON(fiber.Map{"data": scans})
 	})
 
-	app.Get("/scan/:id/status", func(c *fiber.Ctx) error {
+	scanGroup.Get("/scan/:id/status", func(c *fiber.Ctx) error {
 		jobID := c.Params("id")
 		var status, scanType, target string
 		var deviceCount int
@@ -504,7 +540,7 @@ func (s *Scanner) scanHost(ctx context.Context, ip string, portsToScan []int) Di
 		default:
 		}
 
-		addr := fmt.Sprintf("%s:%d", ip, port)
+		addr := net.JoinHostPort(ip, strconv.Itoa(port))
 		conn, err := net.DialTimeout("tcp", addr, 1*time.Second)
 		if err == nil {
 			conn.Close()
@@ -611,7 +647,7 @@ func (s *Scanner) saveDiscoveredDevice(ctx context.Context, jobID string, dev Di
 func isHostAlive(ip string) bool {
 	ports := []int{80, 554, 443, 8080, 22}
 	for _, port := range ports {
-		conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, port), 500*time.Millisecond)
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, strconv.Itoa(port)), 500*time.Millisecond)
 		if err == nil {
 			conn.Close()
 			return true
