@@ -6,12 +6,14 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"camguid/internal/config"
 	"camguid/internal/database"
 	"camguid/internal/handler"
 	"camguid/internal/middleware"
 	"camguid/internal/pkg/logger"
+	"camguid/internal/pkg/streamtoken"
 	"camguid/internal/repository"
 	auth "camguid/internal/service/auth"
 
@@ -20,6 +22,8 @@ import (
 	fiberlogger "github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/gofiber/fiber/v2/middleware/requestid"
+	"github.com/redis/go-redis/v9"
+	"github.com/rs/zerolog"
 )
 
 func main() {
@@ -51,12 +55,27 @@ func main() {
 		log.Fatal().Err(err).Msg("Failed to run migrations")
 	}
 
+	// Redis (rate limiting context; optional at runtime)
+	redisOpts, err := redis.ParseURL(cfg.RedisURL)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Invalid CAMGUID_REDIS_URL")
+	}
+	rdb := redis.NewClient(redisOpts)
+	defer rdb.Close()
+
 	// Repositories
 	userRepo := repository.NewUserRepository(pool)
-	deviceRepo := repository.NewDeviceRepository(pool)
+	deviceRepo := repository.NewDeviceRepository(pool, repository.NewSecretCipher(cfg.EncryptionKey))
+	auditRepo := repository.NewAuditLogRepository(pool)
 
 	// Services
 	authService := auth.NewService(userRepo, cfg.JWTSecret)
+
+	// Stream token signer (HTTPS-only concern: same secret used by relay)
+	streamSigner, err := streamtoken.NewSigner(cfg.StreamSigningSecret)
+	if err != nil {
+		log.Fatal().Err(err).Msg("Invalid CAMGUID_STREAM_SIGNING_SECRET")
+	}
 
 	// Bootstrap default admin
 	if err := authService.EnsureDefaultAdmin(ctx); err != nil {
@@ -64,7 +83,20 @@ func main() {
 	}
 
 	// Handlers
-	h := handler.New(authService, deviceRepo, userRepo)
+	h := handler.New(handler.HandlerOptions{
+		AuthService:     authService,
+		DeviceRepo:      deviceRepo,
+		UserRepo:        userRepo,
+		AuditRepo:       auditRepo,
+		StreamSigner:    streamSigner,
+		StreamTokenTTL:  5 * time.Minute,
+		Redis:           rdb,
+		LoginRateLimit:  cfg.LoginRateLimit,
+		LoginRateWindow: time.Duration(cfg.LoginRateWindow) * time.Second,
+	})
+
+	// Audit retention sweep
+	go auditRetentionSweep(ctx, auditRepo, cfg.AuditRetentionDays, log)
 
 	// Fiber app
 	app := fiber.New(fiber.Config{
@@ -80,7 +112,7 @@ func main() {
 	}))
 	app.Use(cors.New(cors.Config{
 		AllowOrigins: "*",
-		AllowHeaders: "Origin, Content-Type, Accept, Authorization",
+		AllowHeaders: "Origin, Content-Type, Accept, Authorization, X-Stream-Token",
 		AllowMethods: "GET, POST, PUT, PATCH, DELETE",
 	}))
 
@@ -90,9 +122,9 @@ func main() {
 	// Health (public)
 	api.Get("/health", h.HealthCheck)
 
-	// Auth (public)
+	// Auth (public) — login is rate-limited per IP+username
 	authGroup := api.Group("/auth")
-	authGroup.Post("/login", h.Login)
+	authGroup.Post("/login", middleware.LoginRateLimit(rdb, cfg.LoginRateLimit, time.Duration(cfg.LoginRateWindow)*time.Second), h.Login)
 	authGroup.Post("/refresh", h.RefreshToken)
 
 	// Protected routes
@@ -103,18 +135,29 @@ func main() {
 	protected.Put("/auth/password", h.ChangePassword)
 	protected.Post("/auth/register", middleware.RequireRole("admin"), h.Register)
 
-	// Dashboard
+	// RBAC route matrix:
+	//   viewer  — read-only: dashboard stats, devices list/get, stream token mint
+	//   operator — device management (create/update/delete/toggle/channels)
+	//   admin   — user management, audit logs
 	protected.Get("/dashboard/stats", h.GetDashboardStats)
 
 	// Devices
 	devices := protected.Group("/devices")
 	devices.Get("/", h.ListDevices)
 	devices.Get("/:id", h.GetDevice)
-	devices.Post("/", middleware.RequireRole("admin"), h.CreateDevice)
-	devices.Put("/:id", middleware.RequireRole("admin"), h.UpdateDevice)
-	devices.Delete("/:id", middleware.RequireRole("admin"), h.DeleteDevice)
-	devices.Patch("/:id/toggle", middleware.RequireRole("admin"), h.ToggleDevice)
-	devices.Post("/:id/channels", middleware.RequireRole("admin"), h.GenerateChannels)
+	devices.Post("/", middleware.RequireRole("admin", "operator"), h.CreateDevice)
+	devices.Put("/:id", middleware.RequireRole("admin", "operator"), h.UpdateDevice)
+	devices.Delete("/:id", middleware.RequireRole("admin", "operator"), h.DeleteDevice)
+	devices.Patch("/:id/toggle", middleware.RequireRole("admin", "operator"), h.ToggleDevice)
+	devices.Post("/:id/channels", middleware.RequireRole("admin", "operator"), h.GenerateChannels)
+
+	// Streams
+	protected.Post("/stream/token", h.MintStreamToken)
+
+	// Audit logs
+	audit := protected.Group("/audit-logs", middleware.RequireRole("admin", "operator"))
+	audit.Get("/", h.ListAuditLogs)
+	audit.Get("/export", h.ExportAuditLogs)
 
 	// Graceful shutdown
 	go func() {
@@ -129,6 +172,37 @@ func main() {
 
 	log.Info().Msg("Shutting down API server...")
 	app.Shutdown()
+}
+
+// auditRetentionSweep periodically purges audit entries older than the
+// configured retention window.
+func auditRetentionSweep(ctx context.Context, repo *repository.AuditLogRepository, days int, log zerolog.Logger) {
+	cutoff := time.Now().AddDate(0, 0, -days)
+
+	start := time.Now()
+	deleted, err := repo.DeleteOlderThan(ctx, cutoff)
+	if err != nil {
+		log.Err(err).Msg("Audit retention sweep failed")
+		return
+	}
+	if deleted > 0 {
+		log.Info().Int64("deleted", deleted).Dur("elapsed", time.Since(start)).Msg("Audit retention sweep completed")
+	}
+
+	// Re-run daily (24h). A simple interval keeps the sweep self-healing.
+	ticker := time.NewTicker(24 * time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cutoff := time.Now().AddDate(0, 0, -days)
+			if n, err := repo.DeleteOlderThan(ctx, cutoff); err == nil && n > 0 {
+				log.Info().Int64("deleted", n).Msg("Audit retention sweep completed")
+			}
+		}
+	}
 }
 
 func customErrorHandler(c *fiber.Ctx, err error) error {

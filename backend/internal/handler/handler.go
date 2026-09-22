@@ -3,26 +3,82 @@ package handler
 import (
 	"camguid/internal/middleware"
 	"camguid/internal/models"
+	"camguid/internal/pkg/streamtoken"
 	"camguid/internal/repository"
 	auth "camguid/internal/service/auth"
+	"encoding/json"
 	"strconv"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 )
 
 type Handler struct {
-	authService *auth.Service
-	deviceRepo  *repository.DeviceRepository
-	userRepo    *repository.UserRepository
+	authService     *auth.Service
+	deviceRepo      *repository.DeviceRepository
+	userRepo        *repository.UserRepository
+	auditRepo       *repository.AuditLogRepository
+	streamSigner    *streamtoken.Signer
+	streamTokenTTL  time.Duration
+	rdb             *redis.Client
+	loginRateLimit  int
+	loginRateWindow time.Duration
 }
 
-func New(authSvc *auth.Service, deviceRepo *repository.DeviceRepository, userRepo *repository.UserRepository) *Handler {
+type HandlerOptions struct {
+	AuthService     *auth.Service
+	DeviceRepo      *repository.DeviceRepository
+	UserRepo        *repository.UserRepository
+	AuditRepo       *repository.AuditLogRepository
+	StreamSigner    *streamtoken.Signer
+	StreamTokenTTL  time.Duration
+	Redis           *redis.Client
+	LoginRateLimit  int
+	LoginRateWindow time.Duration
+}
+
+func New(opts HandlerOptions) *Handler {
 	return &Handler{
-		authService: authSvc,
-		deviceRepo:  deviceRepo,
-		userRepo:    userRepo,
+		authService:     opts.AuthService,
+		deviceRepo:      opts.DeviceRepo,
+		userRepo:        opts.UserRepo,
+		auditRepo:       opts.AuditRepo,
+		streamSigner:    opts.StreamSigner,
+		streamTokenTTL:  opts.StreamTokenTTL,
+		rdb:             opts.Redis,
+		loginRateLimit:  opts.LoginRateLimit,
+		loginRateWindow: opts.LoginRateWindow,
 	}
+}
+
+// writeAudit persists a single audit entry for the authenticated request.
+// Failures to log are ignored — auditing must never break the request path.
+func (h *Handler) writeAudit(c *fiber.Ctx, action, resource string, resourceID *uuid.UUID, result string, details interface{}) {
+	if h.auditRepo == nil {
+		return
+	}
+	var raw json.RawMessage
+	if details != nil {
+		if b, err := json.Marshal(details); err == nil {
+			raw = b
+		}
+	}
+	uid := middleware.GetUserID(c)
+	ip := c.IP()
+	actor := middleware.GetUsername(c)
+	entry := &models.AuditLog{
+		UserID:     &uid,
+		Actor:      &actor,
+		Action:     action,
+		Resource:   &resource,
+		ResourceID: resourceID,
+		Details:    raw,
+		Result:     result,
+		IPAddress:  &ip,
+	}
+	_ = h.auditRepo.Log(c.Context(), entry)
 }
 
 // --- Auth Handlers ---
@@ -42,17 +98,24 @@ func (h *Handler) Login(c *fiber.Ctx) error {
 
 	tokens, user, err := h.authService.Login(c.Context(), req)
 	if err != nil {
+		if h.rdb != nil {
+			middleware.RecordLoginFailure(h.rdb, middleware.LoginFailKey(c.IP(), req.Username), h.loginRateWindow)
+		}
+		h.writeAudit(c, "auth.login", "user", nil, "fail", map[string]string{"username": req.Username})
 		return c.Status(401).JSON(models.ErrorResponse{Error: models.ErrorDetail{
 			Code: "AUTH_FAILED", Message: err.Error(),
 		}})
 	}
 
+	h.writeAudit(c, "auth.login", "user", &user.ID, "success", map[string]string{"username": req.Username})
+
 	return c.JSON(fiber.Map{
 		"tokens": tokens,
 		"user": fiber.Map{
-			"id":       user.ID,
-			"username": user.Username,
-			"role":     user.Role,
+			"id":                  user.ID,
+			"username":            user.Username,
+			"role":                user.Role,
+			"must_change_password": user.MustChangePassword,
 		},
 	})
 }
@@ -102,10 +165,12 @@ func (h *Handler) Register(c *fiber.Ctx) error {
 
 	user, err := h.authService.Register(c.Context(), req)
 	if err != nil {
+		h.writeAudit(c, "user.create", "user", nil, "fail", map[string]string{"username": req.Username, "error": err.Error()})
 		return c.Status(409).JSON(models.ErrorResponse{Error: models.ErrorDetail{
 			Code: "REGISTER_FAILED", Message: err.Error(),
 		}})
 	}
+	h.writeAudit(c, "user.create", "user", &user.ID, "success", map[string]string{"username": req.Username, "role": req.Role})
 	return c.Status(201).JSON(user)
 }
 
@@ -119,10 +184,12 @@ func (h *Handler) ChangePassword(c *fiber.Ctx) error {
 
 	userID := middleware.GetUserID(c)
 	if err := h.authService.ChangePassword(c.Context(), userID, req); err != nil {
+		h.writeAudit(c, "auth.password_change", "user", &userID, "fail", map[string]string{"error": err.Error()})
 		return c.Status(400).JSON(models.ErrorResponse{Error: models.ErrorDetail{
 			Code: "PASSWORD_CHANGE_FAILED", Message: err.Error(),
 		}})
 	}
+	h.writeAudit(c, "auth.password_change", "user", &userID, "success", nil)
 	return c.JSON(fiber.Map{"message": "Password changed successfully"})
 }
 
@@ -226,10 +293,14 @@ func (h *Handler) CreateDevice(c *fiber.Ctx) error {
 	}
 
 	if err := h.deviceRepo.Create(c.Context(), device); err != nil {
+		h.writeAudit(c, "device.create", "device", &device.ID, "fail", map[string]string{"error": err.Error()})
 		return c.Status(500).JSON(models.ErrorResponse{Error: models.ErrorDetail{
 			Code: "CREATE_FAILED", Message: "Failed to create device: " + err.Error(),
 		}})
 	}
+
+	h.writeAudit(c, "device.create", "device", &device.ID, "success",
+		map[string]string{"name": device.Name, "type": device.DeviceType})
 
 	return c.Status(201).JSON(device)
 }
@@ -250,10 +321,13 @@ func (h *Handler) UpdateDevice(c *fiber.Ctx) error {
 	}
 
 	if err := h.deviceRepo.Update(c.Context(), id, req); err != nil {
+		h.writeAudit(c, "device.update", "device", &id, "fail", map[string]string{"error": err.Error()})
 		return c.Status(500).JSON(models.ErrorResponse{Error: models.ErrorDetail{
 			Code: "UPDATE_FAILED", Message: "Failed to update device",
 		}})
 	}
+
+	h.writeAudit(c, "device.update", "device", &id, "success", nil)
 
 	device, _ := h.deviceRepo.GetByID(c.Context(), id)
 	return c.JSON(device)
@@ -268,10 +342,12 @@ func (h *Handler) DeleteDevice(c *fiber.Ctx) error {
 	}
 
 	if err := h.deviceRepo.Delete(c.Context(), id); err != nil {
+		h.writeAudit(c, "device.delete", "device", &id, "fail", map[string]string{"error": err.Error()})
 		return c.Status(500).JSON(models.ErrorResponse{Error: models.ErrorDetail{
 			Code: "DELETE_FAILED", Message: "Failed to delete device",
 		}})
 	}
+	h.writeAudit(c, "device.delete", "device", &id, "success", nil)
 	return c.SendStatus(204)
 }
 
@@ -284,10 +360,13 @@ func (h *Handler) ToggleDevice(c *fiber.Ctx) error {
 	}
 
 	if err := h.deviceRepo.ToggleEnabled(c.Context(), id); err != nil {
+		h.writeAudit(c, "device.toggle", "device", &id, "fail", map[string]string{"error": err.Error()})
 		return c.Status(500).JSON(models.ErrorResponse{Error: models.ErrorDetail{
 			Code: "TOGGLE_FAILED", Message: "Failed to toggle device",
 		}})
 	}
+
+	h.writeAudit(c, "device.toggle", "device", &id, "success", nil)
 
 	device, _ := h.deviceRepo.GetByID(c.Context(), id)
 	return c.JSON(device)
