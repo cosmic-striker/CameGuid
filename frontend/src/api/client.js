@@ -78,17 +78,31 @@ export const scansAPI = {
 };
 
 export const streamsAPI = {
-  start: (data) => api.post('/start', data, { baseURL: '/stream/api' }),
-  stop: (id) => api.delete(`/stop/${id}`, { baseURL: '/stream/api' }),
-  list: () => api.get('/sessions', { baseURL: '/stream/api' }),
-  heartbeat: (id) => api.post(`/heartbeat/${id}`, {}, { baseURL: '/stream/api' }),
+  // Mint a short-lived HMAC token for a device. Sent as X-Stream-Token on
+  // every relay call so raw RTSP URLs (which can embed credentials) never
+  // leave the backend.
+  token: (deviceId) => api.post('/stream/token', { device_id: deviceId }),
+  start: (deviceId, channel = 1, token) => api.post(
+    '/start', { channel }, { baseURL: '/stream/api', headers: { 'X-Stream-Token': token } }),
+  stop: (id, token) => api.delete(`/stop/${id}`, { baseURL: '/stream/api', headers: { 'X-Stream-Token': token } }),
+  list: (token) => api.get('/sessions', { baseURL: '/stream/api', headers: { 'X-Stream-Token': token } }),
+  heartbeat: (id, token) => api.post(
+    `/heartbeat/${id}`, {}, { baseURL: '/stream/api', headers: { 'X-Stream-Token': token } }),
 };
 
 export const snapshotsAPI = {
-  capture: (data) => api.post('/snapshot/capture', data, { baseURL: '/stream/api' }),
-  start: (data) => api.post('/snapshot/start', data, { baseURL: '/stream/api' }),
-  stop: (deviceId) => api.delete(`/snapshot/stop/${deviceId}`, { baseURL: '/stream/api' }),
-  jobs: () => api.get('/snapshot/jobs', { baseURL: '/stream/api' }),
+  capture: (deviceId, token, { channel = 1, width } = {}) => api.post(
+    '/snapshot/capture', { channel, width }, { baseURL: '/stream/api', headers: { 'X-Stream-Token': token } }),
+  start: (deviceId, token, { channel = 1, width, interval } = {}) => api.post(
+    '/snapshot/start', { channel, width, interval }, { baseURL: '/stream/api', headers: { 'X-Stream-Token': token } }),
+  stop: (deviceId, token) => api.delete(
+    `/snapshot/stop/${deviceId}`, { baseURL: '/stream/api', headers: { 'X-Stream-Token': token } }),
+  jobs: (token) => api.get('/snapshot/jobs', { baseURL: '/stream/api', headers: { 'X-Stream-Token': token } }),
   // Snapshot image URL served by nginx from the shared volume — no auth needed
   url: (deviceId, ts) => `/stream/snapshots/${deviceId}.jpg${ts ? `?t=${ts}` : ''}`,
+};
+
+export const auditAPI = {
+  list: (params) => api.get('/audit-logs', { params }),
+  export: () => api.get('/audit-logs/export', { responseType: 'blob' }),
 };

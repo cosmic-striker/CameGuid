@@ -134,26 +134,37 @@ function VideoCell({ device, live, onToggleLive }) {
   const videoRef = useRef(null);
   const hlsRef = useRef(null);
   const sessionIdRef = useRef(null);
+  const tokenRef = useRef(null);
   const [error, setError] = useState(null);
   const [loading, setLoading] = useState(false);
   const [retryKey, setRetryKey] = useState(0);
   const [snapTs, setSnapTs] = useState(Date.now());
 
+  // Mint (and refresh) a short-lived relay stream token for this device. The
+  // token is sent as X-Stream-Token on relay calls instead of the raw RTSP URL,
+  // which may embed credentials and must never leave the backend.
+  const getToken = useCallback(async () => {
+    const { data } = await streamsAPI.token(device.id);
+    tokenRef.current = data.token;
+    setTimeout(() => { tokenRef.current = null; }, Math.max(data.expires_in - 10, 5) * 1000);
+    return data.token;
+  }, [device]);
+
   // ---- Thumbnail mode: request a fresh capture and poll the image ----
   useEffect(() => {
     if (live || !device) return;
-    if (device.stream_url) {
-      snapshotsAPI
-        .capture({ device_id: device.id, channel: 1, stream_url: device.stream_url })
+    if (device.stream_configured) {
+      getToken()
+        .then((token) => snapshotsAPI.capture(device.id, token).catch(() => {}))
         .catch(() => {});
     }
     const timer = setInterval(() => setSnapTs(Date.now()), SNAPSHOT_REFRESH_MS);
     return () => clearInterval(timer);
-  }, [live, device, retryKey]);
+  }, [live, device, getToken, retryKey]);
 
   const startLive = useCallback(() => {
     if (!device) return;
-    if (!device.stream_url) {
+    if (!device.stream_configured) {
       setError('No RTSP stream URL configured');
       return;
     }
@@ -161,11 +172,8 @@ function VideoCell({ device, live, onToggleLive }) {
     setLoading(true);
     setError(null);
 
-    streamsAPI.start({
-      device_id: device.id,
-      channel: 1,
-      stream_url: device.stream_url,
-    })
+    getToken()
+      .then((token) => streamsAPI.start(device.id, 1, token))
       .then(({ data }) => {
         setLoading(false);
         sessionIdRef.current = data.session_id;
@@ -193,7 +201,7 @@ function VideoCell({ device, live, onToggleLive }) {
         setError('Failed to start stream relay');
         console.error('Relay error:', err);
       });
-  }, [device, retryKey]);
+  }, [device, getToken, retryKey]);
 
   // ---- Start / stop the live HLS session when the cell is toggled ----
   useEffect(() => {
@@ -220,7 +228,7 @@ function VideoCell({ device, live, onToggleLive }) {
       if (videoRef.current) videoRef.current.src = '';
       const sid = sessionIdRef.current;
       sessionIdRef.current = null;
-      if (sid) streamsAPI.stop(sid).catch(() => {});
+      if (sid) streamsAPI.stop(sid, tokenRef.current).catch(() => {});
     };
   }, [live, startLive]);
 
@@ -229,7 +237,7 @@ function VideoCell({ device, live, onToggleLive }) {
     if (!live) return;
     const timer = setInterval(() => {
       if (sessionIdRef.current) {
-        streamsAPI.heartbeat(sessionIdRef.current).catch(() => {});
+        streamsAPI.heartbeat(sessionIdRef.current, tokenRef.current).catch(() => {});
       }
     }, HEARTBEAT_MS);
     return () => clearInterval(timer);
@@ -288,7 +296,7 @@ function VideoCell({ device, live, onToggleLive }) {
         </>
       ) : (
         <>
-          {device.stream_url ? (
+          {device.stream_configured ? (
             <img
               className="video-cell-thumb"
               src={snapshotsAPI.url(device.id, snapTs)}

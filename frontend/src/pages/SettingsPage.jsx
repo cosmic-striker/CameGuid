@@ -123,6 +123,7 @@ function UserManagementSection() {
           <label className="input-label">Role</label>
           <select className="input" value={form.role} onChange={(e) => setForm({...form, role: e.target.value})}>
             <option value="viewer">Viewer</option>
+            <option value="operator">Operator</option>
             <option value="admin">Admin</option>
           </select>
         </div>

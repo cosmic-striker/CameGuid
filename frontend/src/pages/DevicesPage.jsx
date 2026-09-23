@@ -14,7 +14,7 @@ export default function DevicesPage() {
   const [editDevice, setEditDevice] = useState(null);
   const { addToast } = useToastStore();
   const { user } = useAuthStore();
-  const isAdmin = user?.role === 'admin';
+  const canManage = user?.role === 'admin' || user?.role === 'operator';
 
   const fetchDevices = () => {
     setLoading(true);
@@ -61,7 +61,7 @@ export default function DevicesPage() {
     <>
       <div className="main-header">
         <h1 className="page-title">Devices</h1>
-        {isAdmin && (
+        {canManage && (
           <button className="btn btn-primary" onClick={() => { setEditDevice(null); setShowModal(true); }}>
             <Plus size={16} /> Add Device
           </button>
@@ -99,7 +99,7 @@ export default function DevicesPage() {
                 <th>IP Address</th>
                 <th>Manufacturer</th>
                 <th>Tags</th>
-                {isAdmin && <th>Actions</th>}
+                {canManage && <th>Actions</th>}
               </tr>
             </thead>
             <tbody>
@@ -128,7 +128,7 @@ export default function DevicesPage() {
                       <span key={i} className="badge badge-amber" style={{ marginRight: 4 }}>{t}</span>
                     ))}
                   </td>
-                  {isAdmin && (
+                  {canManage && (
                     <td>
                       <div className="flex gap-sm">
                         {d.device_type === 'nvr' && (
@@ -186,19 +186,25 @@ function DeviceModal({ device, onClose, onSave }) {
     manufacturer: device?.manufacturer || '',
     model: device?.model || '',
     location: device?.location || '',
-    stream_url: device?.stream_url || '',
+    stream_url: '',
     notes: device?.notes || '',
     channel_count: device?.channel_count || 1,
   });
   const [saving, setSaving] = useState(false);
   const { addToast } = useToastStore();
+  const hasStoredUrl = !!device?.stream_configured;
 
   const handleSubmit = async (e) => {
     e.preventDefault();
     setSaving(true);
     try {
       if (isEditing) {
-        await devicesAPI.update(device.id, form);
+        // stream_url is stored encrypted and never returned to the browser.
+        // Only send a new value when the user actually typed one — an empty
+        // field keeps the previously configured URL.
+        const payload = { ...form };
+        if (!payload.stream_url) delete payload.stream_url;
+        await devicesAPI.update(device.id, payload);
         addToast('Device updated', 'success');
       } else {
         await devicesAPI.create(form);
@@ -256,8 +262,17 @@ function DeviceModal({ device, onClose, onSave }) {
                 className="input" 
                 value={form.stream_url} 
                 onChange={set('stream_url')} 
-                placeholder={form.device_type === 'nvr' ? "rtsp://user:pass@ip:554/cam/realmonitor..." : "rtsp://user:pass@ip:554/stream1"} 
+                placeholder={
+                  hasStoredUrl
+                    ? "••••••••• (stored encrypted — leave blank to keep)"
+                    : (form.device_type === 'nvr' ? "rtsp://user:pass@ip:554/cam/realmonitor..." : "rtsp://user:pass@ip:554/stream1")
+                } 
               />
+              {hasStoredUrl && (
+                <span className="text-xs text-muted" style={{ marginTop: 4 }}>
+                  Stored encrypted. Enter a new URL to replace it; leave blank to keep the existing one.
+                </span>
+              )}
               {form.device_type === 'nvr' && (
                 <span className="text-xs text-muted" style={{ marginTop: 4 }}>
                   Tip: Put NVR credentials in the URL here, then use the Magic Wand icon to auto-generate camera channels!

@@ -9,6 +9,7 @@ import LiveWallPage from './pages/LiveWallPage';
 import ScanCenterPage from './pages/ScanCenterPage';
 import SettingsPage from './pages/SettingsPage';
 import LogsPage from './pages/LogsPage';
+import MustChangePasswordPage from './pages/MustChangePasswordPage';
 import { Monitor, LayoutDashboard, Camera, Wifi, Settings, ScrollText, Shield, LogOut } from 'lucide-react';
 
 function App() {
@@ -41,11 +42,19 @@ function ProtectedLayout() {
 
   if (!isAuthenticated) return null;
 
+  // Hard gate: accounts flagged must_change_password cannot see any other page
+  // until they set a real password (e.g. the bootstrap admin).
+  const mustChange = !!user?.must_change_password;
+  if (mustChange && window.location.pathname !== '/change-password') {
+    return <Navigate to="/change-password" replace />;
+  }
+
   return (
     <div className="app-layout">
       <Sidebar user={user} onLogout={() => { logout(); navigate('/login'); }} />
       <div className="main-content">
         <Routes>
+          <Route path="/change-password" element={<MustChangePasswordPage />} />
           <Route path="/" element={<Navigate to="/dashboard" replace />} />
           <Route path="/dashboard" element={<DashboardPage />} />
           <Route path="/devices" element={<DevicesPage />} />
@@ -60,13 +69,15 @@ function ProtectedLayout() {
 }
 
 function Sidebar({ user, onLogout }) {
+  const role = user?.role || 'viewer';
+  const canManage = role === 'admin' || role === 'operator';
   const navItems = [
     { path: '/dashboard', icon: LayoutDashboard, label: 'Dashboard' },
     { path: '/live-wall', icon: Monitor, label: 'Live Wall' },
     { path: '/devices', icon: Camera, label: 'Devices' },
-    { path: '/scan-center', icon: Wifi, label: 'Scan Center' },
+    ...(canManage ? [{ path: '/scan-center', icon: Wifi, label: 'Scan Center' }] : []),
     { path: '/settings', icon: Settings, label: 'Settings' },
-    { path: '/logs', icon: ScrollText, label: 'Audit Logs' },
+    ...(canManage ? [{ path: '/logs', icon: ScrollText, label: 'Audit Logs' }] : []),
   ];
 
   return (

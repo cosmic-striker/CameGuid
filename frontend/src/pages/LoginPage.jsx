@@ -22,8 +22,13 @@ export default function LoginPage() {
     try {
       const { data } = await authAPI.login(username, password);
       login(data.user, data.tokens);
-      addToast('Welcome back, ' + data.user.username + '!', 'success');
-      navigate('/dashboard');
+      if (data.user.must_change_password) {
+        addToast('Welcome — please set a new password to continue.', 'info');
+        navigate('/change-password');
+      } else {
+        addToast('Welcome back, ' + data.user.username + '!', 'success');
+        navigate('/dashboard');
+      }
     } catch (err) {
       setError(err.response?.data?.error?.message || 'Login failed. Check your credentials.');
     } finally {
