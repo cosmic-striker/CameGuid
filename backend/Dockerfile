@@ -35,7 +35,7 @@ EXPOSE 8081
 CMD ["scanner"]
 
 FROM alpine:3.20 AS relay
-RUN apk add --no-cache ca-certificates ffmpeg tzdata
+RUN apk add --no-cache ca-certificates ffmpeg wget tzdata
 COPY --from=build-relay /relay /usr/local/bin/relay
 RUN mkdir -p /tmp/streams /tmp/snapshots
 EXPOSE 8082

@@ -69,7 +69,11 @@ jobs:
         run: ./scripts/ci/smoke-test.sh
       - name: Upload logs on failure
         if: failure()
+        env:
+          NVR_STREAM_SIGNING_SECRET: ci-smoke-cleanup-secret
         run: docker compose logs --no-color | tail -200
       - name: Tear down
         if: always()
+        env:
+          NVR_STREAM_SIGNING_SECRET: ci-smoke-cleanup-secret
         run: docker compose down -v --remove-orphans
