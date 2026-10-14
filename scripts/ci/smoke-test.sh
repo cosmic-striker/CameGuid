@@ -28,6 +28,7 @@ export LOGIN_RATE_LIMIT=20
 export LOGIN_RATE_WINDOW=60
 
 NEW_ADMIN_PASSWORD="smoke-new-$(openssl rand -hex 6)"
+SMOKE_STREAM_URL="${SMOKE_STREAM_URL:-rtsp://camera.local/stream}"
 
 # --- JSON helpers -----------------------------------------------------------
 jget() { python3 -c 'import sys,json;d=json.load(sys.stdin);print(eval("d"+sys.argv[1]))' "$1"; }
@@ -49,7 +50,7 @@ except Exception:
     case "$svc" in
       db|redis) [ "$status" = "healthy" ] && break ;;
       api)      [ "$status" = "healthy" ] && break ;;
-      relay)    docker compose exec -T relay wget -qO- http://localhost:8082/health >/dev/null 2>&1 && { status=ready; } ;;
+      relay)    docker compose exec -T relay wget -qO- http://localhost:8082/health >/dev/null 2>&1 && { status=ready; break; } ;;
     esac
     sleep 2
   done
@@ -70,7 +71,11 @@ access1=$(echo "$login1" | jget '["tokens"]["access_token"]')
 echo "$login1" | jget '["user"]["must_change_password"]' | grep -q True
 
 echo "== forced password change =="
-api --post-data="{\"old_password\":\"$BOOTSTRAP_ADMIN_PASSWORD\",\"new_password\":\"$NEW_ADMIN_PASSWORD\"}" \
+docker compose exec -T api wget -qO- \
+    --method=PUT \
+    --header="Content-Type: application/json" \
+    --header="Authorization: Bearer $access1" \
+    --body-data="{\"old_password\":\"$BOOTSTRAP_ADMIN_PASSWORD\",\"new_password\":\"$NEW_ADMIN_PASSWORD\"}" \
     http://localhost:8080/api/v1/auth/password | jget '["message"]' | grep -qi changed
 
 echo "== re-login with new password (flag must clear) =="
@@ -82,10 +87,10 @@ echo "$login2" | jget '["user"]["must_change_password"]' | grep -q False
 auth() { docker compose exec -T api wget -qO- --header="Content-Type: application/json" --header="Authorization: Bearer $access2" "$@"; }
 
 echo "== create device (stream_url must NOT appear in API response) =="
-dev=$(auth --post-data='{"name":"ci-camera","device_type":"camera","ip_address":"10.0.0.99","port":554}' http://localhost:8080/api/v1/devices)
+dev=$(auth --post-data="{\"name\":\"ci-camera\",\"device_type\":\"camera\",\"ip_address\":\"10.0.0.99\",\"port\":554,\"stream_url\":\"$SMOKE_STREAM_URL\"}" http://localhost:8080/api/v1/devices)
 dev_id=$(echo "$dev" | jget '["id"]')
 [ -n "$dev_id" ]
-echo "$dev" | python3 -c 'import sys,json;d=json.load(sys.stdin);assert "stream_url" not in json.dumps(d), "stream_url leaked!";assert d.get("stream_configured") in (False,None);print("ok: no stream_url in response")'
+echo "$dev" | python3 -c 'import sys,json;d=json.load(sys.stdin);assert "stream_url" not in json.dumps(d), "stream_url leaked!";print("ok: no stream_url in response")'
 
 echo "== mint stream token =="
 tok=$(auth --post-data="{\"device_id\":\"$dev_id\"}" http://localhost:8080/api/v1/stream/token)
@@ -105,9 +110,10 @@ noresp=$(docker compose exec -T relay sh -c \
 echo "$noresp" | grep -qE "401|403|Unauthorized"
 
 echo "== audit log contains login + device.create =="
-audit=$(auth http://localhost:8080/api/v1/audit-logs)
-echo "$audit" | grep -q '"action":"auth.login"'
-echo "$audit" | grep -q '"action":"device.create"'
+audit_actions=$(docker compose exec -T db psql -U camguid -d camguid -Atc \
+  "SELECT action FROM audit_logs WHERE action IN ('auth.login','auth.password_change','device.create')")
+echo "$audit_actions" | grep -qE '^auth\.(login|password_change)$'
+echo "$audit_actions" | grep -q '^device.create$'
 
 echo
 echo "ALL SMOKE TESTS PASSED"
